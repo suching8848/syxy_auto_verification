@@ -340,41 +340,125 @@ def do_auth(config, last_auth_time):
     return True
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description=f"Campus Network Auto-Login {VERSION} — 校园网自动认证工具",
-    )
-    parser.add_argument("--auth", action="store_true", help="Test auth once and exit (skip network detection)")
-    parser.add_argument("--version", action="version", version=f"auto_login {VERSION}")
-    args = parser.parse_args()
+def _input(prompt, default=""):
+    """input() wrapper for safe use in frozen exe."""
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        return default
 
-    print(DISCLAIMER, flush=True)
+
+def show_guide():
+    """Print first-time setup guide."""
+    print("=" * 58)
+    print("  校园网自动认证工具 — 使用指南")
+    print("=" * 58)
+    print()
+    print("【第一步：准备配置文件】")
+    print("  1. 找到 auto_login_config.example.json")
+    print("  2. 重命名为 auto_login_config.json（删掉 .example）")
+    print("  3. 用记事本打开，修改以下内容：")
+    print("     - username: 你的学号")
+    print("     - password: 你的校园网密码（通常是身份证后6位）")
+    print("     - portal_host: 校园网认证页面的地址（浏览器登录时看地址栏）")
+    print()
+    print("【第二步：关闭 Windows 自动弹窗（重要！）】")
+    print("  以管理员身份打开 PowerShell，运行：")
+    print("  Set-ItemProperty -Path \"HKLM:\\SYSTEM\\CurrentControlSet\\")
+    print("    Services\\NlaSvc\\Parameters\\Internet\" -Name")
+    print("    \"EnableActiveProbing\" -Value 0 -Type DWord")
+    print("  然后重启电脑。否则 Windows 会自己弹浏览器验证窗口。")
+    print()
+    print("【第三步：测试认证】")
+    print("  双击 auto_login.exe 或在终端运行：")
+    print("    auto_login.exe --auth")
+    print("  看到 Auth test PASSED 说明配置正确。")
+    print()
+    print("【第四步：部署到计划任务（可选）】")
+    print("  以管理员身份运行 PowerShell，执行：")
+    print("    .\\setup_task.ps1")
+    print("  会在每天 17:55 自动启动脚本。如需修改时间，编辑")
+    print("  setup_task.ps1 第 55 行的 -At 参数。")
+    print()
+    print("【定时建议】")
+    print("  把计划任务触发时间设到校园网每天断网前一两分钟。")
+    print("  比如学校每天 18:00 踢号，就设 17:58，这样脚本")
+    print("  提前检测，断网瞬间几秒内完成重连，完全无感。")
+    print()
+    print("【其他说明】")
+    print("  程序默认通过 HTTP 请求后台完成认证，不会弹浏览器。")
+    print("  日志文件在 logs/ 目录下，按日期命名。")
+    print("  如果认证失败，检查日志中的错误提示。")
+    print("  程序免费开源，如付费获取请立即退款。")
+    print()
+    print("=" * 58)
+
+
+def interactive_setup(config):
+    """Walk user through basic config setup, returns updated config dict."""
+    print()
+    print("=" * 58)
+    print("  首次配置向导")
+    print("  按 Enter 保留当前值，输入新值后按 Enter 保存")
+    print("=" * 58)
     print()
 
-    clean_old_logs()
+    fields = [
+        ("username", "学号 / 用户名", ""),
+        ("password", "校园网密码", ""),
+        ("portal_host", "Portal 地址", "http://10.10.200.102"),
+        ("check_url", "网络检测地址", "http://www.baidu.com"),
+    ]
 
-    config = load_config()
-    portal_url = config["portal_url"]
+    for key, label, example in fields:
+        current = config.get(key, "")
+        if current:
+            prompt = f"  {label} [{current}]: "
+        else:
+            prompt = f"  {label} (如 {example}): "
+        val = _input(prompt).strip()
+        if val:
+            config[key] = val
+        elif not current and example and key != "check_url":
+            config[key] = example
+
+    print()
+    print("  配置完成！正在保存...")
+
+    try:
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=4)
+        print(f"  已保存到: {CONFIG_FILE}")
+    except IOError as e:
+        print(f"  保存失败: {e}")
+
+    print()
+    return config
+
+
+def show_menu():
+    """Display menu and return user choice."""
+    print("=" * 58)
+    print("  校园网自动认证工具 " + VERSION)
+    print("=" * 58)
+    print("  [1] 启动自动认证（后台检测 + 断网重连）")
+    print("  [2] 快速测试认证（发一次请求验证配置）")
+    print("  [3] 修改配置（学号 / 密码 / Portal地址）")
+    print("  [4] 查看使用指南")
+    print("  [q] 退出")
+    print("-" * 58)
+    choice = _input("  请选择 [1]: ").strip().lower()
+    return choice or "1"
+
+
+def run_detection_loop(config):
+    """Core detection loop — runs until stopped or duration exceeded."""
     check_url = config["check_url"]
     interval_ok = config["check_interval_ok"]
     interval_fail = config["check_interval_fail"]
     fail_threshold = config["fail_threshold"]
     timeout = config["request_timeout"]
     run_duration = config.get("run_duration_minutes", 0)
-
-    if not portal_url and config.get("auth_method") != "portal_post":
-        log("portal_url is empty, please set it in auto_login_config.json", "ERROR")
-        return
-
-    if args.auth:
-        method = config.get("auth_method", "http")
-        if method == "portal_post":
-            log("Auth test mode: method=portal_post", "START")
-        else:
-            log(f"Auth test mode: method={method} url={portal_url[:60]}...", "START")
-        ok = do_auth(config, None)
-        log(f"Auth test {'PASSED' if ok else 'FAILED'}", "STOP")
-        return
 
     log("Service started" + (" [interactive]" if INTERACTIVE else " [background]"), "START")
     log(f"Config: auth={config.get('auth_method','http')} check={check_url} interval={interval_ok}s threshold={fail_threshold} duration={run_duration}min", "INFO")
@@ -387,8 +471,8 @@ def main():
         log("Continuous mode", "INFO")
 
     fail_count = 0
-    total_checks = 0        # all checks since start
-    outage_checks = 0       # checks during current outage
+    total_checks = 0
+    outage_checks = 0
     outage_start = None
     auth_attempts = 0
     last_auth_time = None
@@ -437,7 +521,6 @@ def main():
                 else:
                     log(f"Check #{fail_count} failed: {detail}", "WARN")
 
-            # --- interactive status line ---
             if INTERACTIVE:
                 uptime = format_duration((datetime.now() - start_time).total_seconds())
                 sleep = interval_fail if was_down else interval_ok
@@ -462,6 +545,91 @@ def main():
         except Exception as e:
             log(f"Unexpected error: {e}", "ERROR")
             time.sleep(interval_fail)
+
+
+def _need_setup(config):
+    """Check if config needs first-time setup."""
+    method = config.get("auth_method", "http")
+    if method == "portal_post":
+        return not config.get("username") or not config.get("password")
+    return not config.get("portal_url")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=f"Campus Network Auto-Login {VERSION} — 校园网自动认证工具",
+    )
+    parser.add_argument("--auth", action="store_true", help="Test auth once and exit")
+    parser.add_argument("--version", action="version", version=f"auto_login {VERSION}")
+    args = parser.parse_args()
+
+    print(DISCLAIMER, flush=True)
+    print()
+    clean_old_logs()
+
+    config = load_config()
+
+    # --auth flag: test auth and exit (works in any mode)
+    if args.auth:
+        if _need_setup(config):
+            log("Config incomplete — running setup first...", "WARN")
+            config = interactive_setup(config)
+        method = config.get("auth_method", "http")
+        if method == "portal_post":
+            log("Auth test mode: method=portal_post", "START")
+        else:
+            log(f"Auth test mode: method={method}", "START")
+        ok = do_auth(config, None)
+        log(f"Auth test {'PASSED' if ok else 'FAILED'}", "STOP")
+        return
+
+    # Background mode (scheduled task): run detection loop directly, no menu
+    if not INTERACTIVE:
+        run_detection_loop(config)
+        return
+
+    # Interactive mode with no flags: show menu
+    while True:
+        # If config is incomplete on first run, prompt setup
+        if _need_setup(config):
+            print("检测到配置文件未完成。")
+            print("如果是从 .example.json 复制来的，请先重命名为 auto_login_config.json")
+            print()
+            do_setup = _input("是否现在配置? [Y/n]: ").strip().lower()
+            if do_setup in ("", "y", "yes"):
+                config = interactive_setup(config)
+            else:
+                print("已跳过。可在菜单选 [3] 修改配置。")
+                print()
+
+        choice = show_menu()
+
+        if choice == "1":
+            run_detection_loop(config)
+
+        elif choice == "2":
+            if _need_setup(config):
+                log("Config incomplete — running setup first...", "WARN")
+                config = interactive_setup(config)
+            method = config.get("auth_method", "http")
+            log(f"Auth test mode: method={method}", "START")
+            ok = do_auth(config, None)
+            log(f"Auth test {'PASSED' if ok else 'FAILED'}", "STOP")
+
+        elif choice == "3":
+            config = interactive_setup(config)
+
+        elif choice == "4":
+            show_guide()
+
+        elif choice == "q":
+            print("再见！")
+            break
+
+        else:
+            print(f"无效选项: {choice}")
+
+        print()
 
 
 if __name__ == "__main__":

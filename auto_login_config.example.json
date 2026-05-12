@@ -1,5 +1,5 @@
 {
-    "check_url": "http://www.baidu.com",
+"check_url": "http://www.baidu.com",
     "check_interval_ok": 5,
     "check_interval_fail": 3,
     "fail_threshold": 2,
