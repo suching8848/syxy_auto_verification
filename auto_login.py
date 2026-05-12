@@ -13,7 +13,20 @@ import argparse
 import re
 from datetime import datetime, timedelta
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = os.path.dirname(sys.executable)
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+VERSION = "v1.1"
+DISCLAIMER = (
+    f"Campus Network Auto-Login {VERSION}\n"
+    "仅供学习研究使用，请勿用于非法用途。\n"
+    "For educational purposes only. Do not use for illegal activities.\n"
+    "项目地址: https://github.com/suching8848/syxy_auto_verification\n"
+    "免费开源，如付费获取请立即退款举报。\n"
+    "Free and open source. If you paid for this, request a refund.\n"
+)
+
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "auto_login_config.json")
 LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
 MAX_LOG_DAYS = 7
@@ -328,9 +341,15 @@ def do_auth(config, last_auth_time):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=f"Campus Network Auto-Login {VERSION} — 校园网自动认证工具",
+    )
     parser.add_argument("--auth", action="store_true", help="Test auth once and exit (skip network detection)")
+    parser.add_argument("--version", action="version", version=f"auto_login {VERSION}")
     args = parser.parse_args()
+
+    print(DISCLAIMER, flush=True)
+    print()
 
     clean_old_logs()
 
@@ -446,4 +465,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if INTERACTIVE:
+            input("\nPress Enter to exit...")

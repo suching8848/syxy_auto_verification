@@ -7,3 +7,8 @@ logs/
 
 # Python
 __pycache__/
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec

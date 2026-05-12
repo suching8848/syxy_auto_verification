@@ -222,7 +222,28 @@ Start-Process msedge -ArgumentList "--auto-open-devtools-for-tabs", "http://www.
 
 然后把抓到的信息填入配置即可。
 
+## 分发给别人（无需安装 Python）
+
+打包成单个 exe，对方不需要装 Python，直接运行：
+
+```powershell
+# 构建（需要先 pip install pyinstaller）
+pyinstaller --onefile --console --name auto_login auto_login.py
+```
+
+构建产物在 `dist/auto_login.exe`。分发给别人时，把 `auto_login.exe` 和一份 `auto_login_config.json`（填好他自己的账号）放在同一目录即可。
+
+运行方式不变：
+
+```powershell
+.\auto_login.exe --auth    # 测试认证
+.\auto_login.exe           # 完整运行
+```
+
+计划任务也直接指向 exe 即可，不需要 pythonw。
+
 ## 依赖
 
 - Python 3（仅标准库，无需 pip 安装）
 - Windows 10/11
+- （如打包成 exe，则无需任何依赖）
