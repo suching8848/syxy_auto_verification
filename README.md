@@ -1,5 +1,7 @@
 # Campus Network Auto-Login
 
+> **当前版本：v1.1** | 免费开源 | 仅供学习研究使用
+
 校园网断线自动认证工具。定时检测网络状态，检测到 captive portal 后通过后台 HTTP 请求静默完成认证，无需打开浏览器。
 
 ## 工作原理
@@ -241,6 +243,35 @@ pyinstaller --onefile --console --name auto_login auto_login.py
 ```
 
 计划任务也直接指向 exe 即可，不需要 pythonw。
+
+## 版本历史
+
+### v1.1 (2026-05-12)
+
+- 新增 `portal_post` 认证模式：自动提取 portal 的 JS 跳转参数，后台 POST 用户名密码完成认证
+- 新增 captive portal 透明代理检测：校验响应内容关键词 + 正则提取 JS 跳转 URL
+- 新增 `--auth` 测试命令：直接发一次认证请求，用于验证配置是否正确
+- 新增 `--version` 版本信息
+- 新增 `check_expected_body` 配置项
+- 支持 PyInstaller 打包成独立 exe，无需安装 Python
+- 修复 PyInstaller 打包后路径检测问题
+- 双击 exe 运行完自动暂停，不会闪退
+
+### v1.0 (初始版本)
+
+- `http` 模式：后台 GET 请求 portal URL 续期
+- `browser` 模式：打开浏览器 + 模拟 Enter
+- 网络检测：HEAD 请求 check_url 判断连通性
+- Windows 计划任务部署（setup_task.ps1）
+- 交互 / 后台双模式自动识别
+- 按日期日志 + 7 天自动清理
+
+## 免责声明
+
+- 本工具**仅供学习研究使用**，请勿用于非法用途
+- **免费开源**，如通过付费渠道获得，请立即退款并举报
+- 使用者自行承担因使用本工具产生的一切后果
+- 项目地址：https://github.com/suching8848/syxy_auto_verification
 
 ## 依赖
 
