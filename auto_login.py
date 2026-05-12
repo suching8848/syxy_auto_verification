@@ -331,9 +331,14 @@ def do_auth(config, last_auth_time):
         start = time.time()
         status, body, info = do_auth_http(url, timeout)
         elapsed = (time.time() - start) * 1000
+        snippet = body[:200].replace("\n", " ").strip() if body else "(empty)"
         if status:
-            snippet = body[:150].replace("\n", " ").strip() if body else "(empty)"
+            body_lower = body.lower() if body else ""
+            if "fail" in body_lower or "error" in body_lower:
+                log(f"Auth FAIL [{info}, {elapsed:.0f}ms] body: {snippet}", "ERROR")
+                return False
             log(f"Auth OK [{info}, {elapsed:.0f}ms] body: {snippet}", "AUTH")
+            log("NOTE: http 模式无法100%确认认证成功，建议改用 portal_post 模式", "WARN")
         else:
             log(f"Auth FAIL [{info}, {elapsed:.0f}ms]", "ERROR")
             return False
