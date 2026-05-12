@@ -17,7 +17,7 @@ if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "v1.1"
+VERSION = "v1.2"
 DISCLAIMER = (
     f"Campus Network Auto-Login {VERSION}\n"
     "仅供学习研究使用，请勿用于非法用途。\n"
