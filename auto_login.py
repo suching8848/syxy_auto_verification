@@ -43,11 +43,10 @@ DEFAULT_CONFIG = {
     "browser_wait_seconds": 3,
     "auth_cooldown_seconds": 30,
     "check_expected_body": "baidu",
-    # portal_post mode fields (if your portal requires POST with credentials)
-    "portal_host": "",
+    # portal_post mode fields (POST credentials to portal)
     "username": "",
     "password": "",
-    # scheduled task trigger time (24h format, used in setup_task.ps1)
+    # scheduled task trigger time (24h format)
     "schedule_time": "17:55",
 }
 
@@ -169,7 +168,7 @@ def do_auth_portal_post(config):
     Step 1: fallback — access portal index.jsp directly, then try API
     Step 2: POST credentials to InterFace.do?method=login
     """
-    portal_host = config.get("portal_host", "")
+    portal_host = config.get("portal_url") or config.get("portal_host", "")
     username = config.get("username", "")
     password = config.get("password", "")
     check_url = config["check_url"]
@@ -405,19 +404,20 @@ def show_seamless_guide(config):
     print("  计划任务需要管理员权限，无法在程序内直接创建。")
     print("  请按以下步骤操作：")
     print()
-    print("  1. 按 Win 键 → 输入 PowerShell")
-    print("  2. 右键 Windows PowerShell → 以管理员身份运行")
-    print("  3. 在蓝色窗口里输入以下命令进入程序目录：")
-    path = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else SCRIPT_DIR
-    print(f"       cd \"{path}\"")
-    print("  4. 然后运行部署脚本：")
+    print("  1. 打开文件管理器，找到你放 auto_login.exe 的文件夹")
+    print("  2. 在地址栏点击，复制完整路径（比如 C:\\Users\\xxx\\Desktop\\校园网）")
+    print("  3. 按 Win 键 → 输入 PowerShell")
+    print("  4. 右键 Windows PowerShell → 以管理员身份运行")
+    print("  5. 在蓝色窗口里输入 cd 空格，然后右键粘贴路径，回车：")
+    print("       cd \"你复制的文件夹路径\"")
+    print("  6. 然后运行部署脚本：")
     print("       .\\setup_task.ps1")
-    print(f"  5. 看到绿色提示即成功。任务会在每天 {stime} 自动启动。")
+    print(f"  7. 看到绿色提示即成功！任务会在每天 {stime} 自动启动。")
     print()
-    print("  ⚠ 如果要改触发时间：")
-    print(f"    用记事本打开 setup_task.ps1，找到 -Daily -At")
-    print(f"    把时间改成你想要的（24 小时制，如 17:58），")
-    print("    保存后重新运行 .\\setup_task.ps1 即可。")
+    print("  ⚠ 修改触发时间：")
+    print("    用记事本打开 setup_task.ps1，找到 -Daily -At 这一行，")
+    print("    把时间改成你想要的（24 小时制，如 17:58），保存后")
+    print("    重新运行 .\\setup_task.ps1 即可。")
     print()
     print("  ┌──────────────────────────────────────────────────┐")
     print("  │ 验证是否生效                                     │")
@@ -456,9 +456,9 @@ def interactive_setup(config):
     print()
 
     fields = [
-        ("username", "学号 / 用户名", ""),
-        ("password", "校园网密码", ""),
-        ("portal_host", "Portal 地址", "http://10.10.200.102"),
+        ("username", "学号/用户名", "2312505051"),
+        ("password", "校园网密码", "身份证后6位"),
+        ("portal_url", "校园网认证地址", "http://10.10.200.102"),
         ("schedule_time", "定时触发时间 (24h制)", "17:55"),
         ("check_url", "网络检测地址", "http://www.baidu.com"),
     ]
@@ -472,7 +472,7 @@ def interactive_setup(config):
         val = _input(prompt).strip()
         if val:
             config[key] = val
-        elif not current and example and key != "check_url":
+        elif not current and example:
             config[key] = example
 
     print()
@@ -503,7 +503,7 @@ def show_menu():
     print("  [5] 使用帮助      — 完整说明和常见问题")
     print("  [q] 退出")
     print("-" * 62)
-    choice = _input("  请选择 [1]: ").strip().lower()
+    choice = _input("  请选择: ").strip().lower()
     return choice or "1"
 
 
@@ -661,6 +661,14 @@ def main():
         choice = show_menu()
 
         if choice == "1":
+            print()
+            print("  ╔════════════════════════════════════════════╗")
+            print("  ║  提示：本窗口关闭后自动认证即停止。       ║")
+            print("  ║  如需长期后台静默运行（不开窗口），       ║")
+            print("  ║  请返回菜单选 [4] 无感部署指南。          ║")
+            print("  ╚════════════════════════════════════════════╝")
+            print()
+            _input("  按 Enter 开始...")
             run_detection_loop(config)
 
         elif choice == "2":
@@ -696,7 +704,7 @@ def main():
             print("  A: 程序所在目录的 logs/ 文件夹，按日期命名。")
             print()
             print("  Q: 认证失败怎么办？")
-            print("  A: 检查三样：学号密码是否正确、portal_host 地址")
+            print("  A: 检查三样：学号密码是否正确、校园网认证地址")
             print("     是否写对、校园网是否换了认证方式。打开日志看")
             print("     [ERROR] 行的具体原因。")
             print()

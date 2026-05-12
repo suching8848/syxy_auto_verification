@@ -8,7 +8,7 @@
     "run_duration_minutes": 60,
     "auth_cooldown_seconds": 30,
     "check_expected_body": "baidu",
-    "portal_host": "http://10.10.200.102",
+    "portal_url": "http://10.10.200.102",
     "username": "你的学号",
     "password": "你的密码",
     "schedule_time": "17:55"
