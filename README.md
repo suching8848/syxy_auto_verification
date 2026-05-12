@@ -226,23 +226,33 @@ Start-Process msedge -ArgumentList "--auto-open-devtools-for-tabs", "http://www.
 
 ## 分发给别人（无需安装 Python）
 
-打包成单个 exe，对方不需要装 Python，直接运行：
+打包成单个 exe，对方不需要装 Python，双击即可使用：
 
 ```powershell
 # 构建（需要先 pip install pyinstaller）
 pyinstaller --onefile --console --name auto_login auto_login.py
 ```
 
-构建产物在 `dist/auto_login.exe`。分发给别人时，把 `auto_login.exe` 和一份 `auto_login_config.json`（填好他自己的账号）放在同一目录即可。
+构建产物在 `dist/auto_login.exe`。分发给别人时，把 `auto_login.exe` 和一份 `auto_login_config.example.json` 放在同一目录即可。
 
-运行方式不变：
+### 电脑小白使用流程
 
-```powershell
-.\auto_login.exe --auth    # 测试认证
-.\auto_login.exe           # 完整运行
+1. 把 `auto_login_config.example.json` 重命名为 `auto_login_config.json`
+2. 双击 `auto_login.exe`
+3. 程序会自动检测配置未完成，引导填写学号、密码
+4. 菜单选 `[2]` 快速测试认证
+5. 测试通过后，菜单选 `[1]` 启动自动认证
+6. 按 `[4]` 查看使用指南，了解如何关闭 Windows 弹窗和部署计划任务
+
+**exe 内置了完整的菜单系统**，不用记命令行参数：
+
 ```
-
-计划任务也直接指向 exe 即可，不需要 pythonw。
+  [1] 启动自动认证（后台检测 + 断网重连）
+  [2] 快速测试认证（发一次请求验证配置）
+  [3] 修改配置（学号 / 密码 / Portal地址）
+  [4] 查看使用指南
+  [q] 退出
+```
 
 ## 版本历史
 
