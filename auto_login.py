@@ -32,7 +32,7 @@ LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
 MAX_LOG_DAYS = 7
 
 DEFAULT_CONFIG = {
-    "portal_url": "",
+    "portal_url": "http://10.10.200.102",
     "check_url": "http://www.baidu.com",
     "check_interval_ok": 30,
     "check_interval_fail": 10,
@@ -458,7 +458,7 @@ def interactive_setup(config):
     fields = [
         ("username", "学号/用户名", "你的学号"),
         ("password", "校园网密码", "你的密码"),
-        ("portal_url", "校园网认证地址", "http://10.10.200.102"),
+        ("portal_url", "校园网认证地址 (不知道可以不填)", "http://10.10.200.102"),
         ("schedule_time", "定时触发时间 (24h制)", "17:55"),
         ("check_url", "网络检测地址", "http://www.baidu.com"),
     ]
@@ -491,14 +491,17 @@ def interactive_setup(config):
 
 def show_menu():
     """Display menu and return user choice."""
+    current_dir = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else SCRIPT_DIR
     print()
     print("=" * 62)
     print("  校园网自动认证工具 " + VERSION)
-    print("  项目地址: https://github.com/suching8848/syxy_auto_verification")
-    print("=" * 62)
+    print("  项目: https://github.com/suching8848/syxy_auto_verification")
+    print("-" * 62)
+    print(f"  程序目录: {current_dir}")
+    print("-" * 62)
     print("  [1] 启动自动认证  — 后台检测 + 断网自动重连")
     print("  [2] 测试认证      — 发一次请求验证配置是否正确")
-    print("  [3] 修改配置      — 学号 / 密码 / Portal 地址")
+    print("  [3] 修改配置      — 学号 / 密码 / 认证地址")
     print("  [4] 无感部署指南  — 关弹窗 + 计划任务（实现完全无感）")
     print("  [5] 使用帮助      — 完整说明和常见问题")
     print("  [q] 退出")
@@ -702,6 +705,12 @@ def main():
             print()
             print("  Q: 日志在哪里？")
             print("  A: 程序所在目录的 logs/ 文件夹，按日期命名。")
+            print()
+            print("  Q: 校园网认证地址在哪看？")
+            print("  A: 打开浏览器手动登录校园网，看地址栏。")
+            print("     通常是 http://10.10.xxx.xxx 这样的 IP。")
+            print("     三亚学院默认为 http://10.10.200.102")
+            print("     不知道的话不用改，默认就能用。")
             print()
             print("  Q: 认证失败怎么办？")
             print("  A: 检查三样：学号密码是否正确、校园网认证地址")
