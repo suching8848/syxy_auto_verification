@@ -108,7 +108,7 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `auth_method` | `"http"` | 认证模式：`"http"` / `"browser"` / `"portal_post"` |
+| `auth_method` | `"portal_post"` | 认证模式：`"portal_post"` / `"http"` / `"browser"` |
 | `check_url` | `http://www.baidu.com` | 用于检测网络的地址（建议用 HTTP，HTTPS 无法被 portal 劫持检测） |
 | `check_expected_body` | `"baidu"` | 响应内容必须包含此关键词，否则判定为 portal 劫持 |
 | `check_interval_ok` | `1` | 网络正常时的检测间隔（秒） |

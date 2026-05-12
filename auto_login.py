@@ -38,7 +38,7 @@ DEFAULT_CONFIG = {
     "check_interval_fail": 5,
     "fail_threshold": 2,
     "request_timeout": 5,
-    "auth_method": "http",
+    "auth_method": "portal_post",
     "run_duration_minutes": 10,
     "browser_wait_seconds": 3,
     "auth_cooldown_seconds": 30,
@@ -274,7 +274,11 @@ def do_auth_portal_post(config):
         resp = opener.open(req, timeout=timeout)
         body = resp.read().decode("utf-8", errors="ignore")
         elapsed = (time.time() - start) * 1000
-        snippet = body[:120].replace("\n", " ").strip()
+        snippet = body[:200].replace("\n", " ").strip()
+        body_lower = body.lower() if body else ""
+        if '"result":"fail"' in body_lower or '"result":"fail"' in body:
+            log(f"Auth FAIL [HTTP {resp.status}, {elapsed:.0f}ms] body: {snippet}", "ERROR")
+            return False
         log(f"Auth OK [HTTP {resp.status}, {elapsed:.0f}ms] body: {snippet}", "AUTH")
         return True
     except Exception as e:
