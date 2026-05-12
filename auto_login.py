@@ -17,7 +17,7 @@ if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "v1.2"
+VERSION = "v1.3"
 DISCLAIMER = (
     f"Campus Network Auto-Login {VERSION}\n"
     "仅供学习研究使用，请勿用于非法用途。\n"
@@ -456,24 +456,24 @@ def interactive_setup(config):
     print()
 
     fields = [
-        ("username", "学号/用户名", "2312505051"),
-        ("password", "校园网密码", "身份证后6位"),
+        ("username", "学号/用户名", "你的学号"),
+        ("password", "校园网密码", "你的密码"),
         ("portal_url", "校园网认证地址", "http://10.10.200.102"),
         ("schedule_time", "定时触发时间 (24h制)", "17:55"),
         ("check_url", "网络检测地址", "http://www.baidu.com"),
     ]
 
-    for key, label, example in fields:
+    for key, label, default_val in fields:
         current = config.get(key, "")
         if current:
             prompt = f"  {label} [{current}]: "
         else:
-            prompt = f"  {label} (如 {example}): "
+            prompt = f"  {label}: "
         val = _input(prompt).strip()
         if val:
             config[key] = val
-        elif not current and example:
-            config[key] = example
+        elif not current and default_val:
+            config[key] = default_val
 
     print()
     print("  配置完成！正在保存...")

@@ -1,6 +1,6 @@
 # Campus Network Auto-Login
 
-> **当前版本：v1.2** | 免费开源 | 仅供学习研究使用
+> **当前版本：v1.3** | 免费开源 | 仅供学习研究使用
 
 校园网断线自动认证工具。定时检测网络状态，检测到 captive portal 后通过后台 HTTP 请求静默完成认证，无需打开浏览器。
 
@@ -48,13 +48,13 @@ logs/                  # 运行日志（按日期，自动清理 7 天前）
     "run_duration_minutes": 60,
     "auth_cooldown_seconds": 30,
     "check_expected_body": "baidu",
-    "portal_host": "http://10.10.200.102",
+    "portal_url": "http://10.10.200.102",
     "username": "你的学号",
     "password": "你的密码"
 }
 ```
 
-> `portal_host` 通常在浏览器手动登录时地址栏里就能看到，一般是 `http://10.10.xxx.xxx` 这样的 IP。
+> `portal_url` 填校园网认证页面的地址，浏览器手动登录时看地址栏就能找到。
 
 ### 2. 手动测试
 
@@ -122,7 +122,7 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 
 | 字段 | 说明 |
 |---|---|
-| `portal_host` | Portal 服务器地址，如 `http://10.10.200.102` |
+| `portal_url` | Portal 认证地址（portal_post 模式填基地址如 `http://10.10.200.102`，http 模式填完整续期 URL） |
 | `username` | 校园网用户名 / 学号 |
 | `password` | 校园网密码 |
 
@@ -220,7 +220,7 @@ Start-Process msedge -ArgumentList "--auto-open-devtools-for-tabs", "http://www.
 2. 在认证页面输入账号密码登录
 3. 登录成功后，找 Network 列表里 Method 为 **POST** 的请求（通常是 `InterFace.do?method=login`）
 4. 点 **Payload** 标签，确认表单字段名（`userId`、`password` 等），如果字段名不同需要改脚本 `do_auth_portal_post()` 中的 form_data
-5. 从地址栏或请求 URL 中提取 `portal_host`
+5. 从地址栏或请求 URL 中提取认证地址填入 `portal_url`
 
 然后把抓到的信息填入配置即可。
 
@@ -247,14 +247,24 @@ pyinstaller --onefile --console --name auto_login auto_login.py
 **exe 内置了完整的菜单系统**，不用记命令行参数：
 
 ```
-  [1] 启动自动认证（后台检测 + 断网重连）
-  [2] 快速测试认证（发一次请求验证配置）
-  [3] 修改配置（学号 / 密码 / Portal地址）
-  [4] 查看使用指南
+  [1] 启动自动认证  — 后台检测 + 断网自动重连
+  [2] 测试认证      — 发一次请求验证配置是否正确
+  [3] 修改配置      — 学号 / 密码 / Portal 地址
+  [4] 无感部署指南  — 关弹窗 + 计划任务（实现完全无感）
+  [5] 使用帮助      — 完整说明和常见问题
   [q] 退出
 ```
 
 ## 版本历史
+
+### v1.3 (2026-05-13)
+
+- 统一配置项：`portal_host` 合并为 `portal_url`，消除混淆
+- 配置向导优化：去掉"如"前缀，标签简洁清晰，通用示例值
+- 启动认证增加提示：窗口关闭即停止，引导用户部署计划任务
+- 无感部署指南：恢复弹窗命令、通用路径描述、手把手 PowerShell 步骤
+- 新增 `schedule_time` 配置项，向导中可设定时时间
+- 菜单新增 [4] 无感部署指南、[5] 使用帮助 FAQ
 
 ### v1.2 (2026-05-12)
 
