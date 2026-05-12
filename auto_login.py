@@ -47,6 +47,8 @@ DEFAULT_CONFIG = {
     "portal_host": "",
     "username": "",
     "password": "",
+    # scheduled task trigger time (24h format, used in setup_task.ps1)
+    "schedule_time": "17:55",
 }
 
 # True when user runs `python auto_login.py` directly (has a console)
@@ -353,65 +355,95 @@ def _input(prompt, default=""):
         return default
 
 
-def show_seamless_guide():
+def show_seamless_guide(config):
     """Print guide for achieving fully seamless (no-popup) auth."""
+    stime = config.get("schedule_time", "17:55")
+    stime_early = _shift_time(stime, -2)
     print()
-    print("=" * 62)
+    print("=" * 66)
     print("  如何实现完全【无感】认证")
-    print("=" * 62)
+    print("=" * 66)
     print()
-    print('  所谓"无感"，就是断网→认证→恢复全程后台静默，')
-    print("  不弹任何窗口，不影响你打游戏/看视频。需要做两件事：")
+    print('  所谓"无感"：断网 → 后台自动认证 → 恢复联网，')
+    print("  整个过程不弹任何窗口，不影响你打游戏或看视频。")
     print()
-    print("  ┌──────────────────────────────────────────────┐")
-    print("  │ 第一步：关闭 Windows 自带的弹窗（必须做！）   │")
-    print("  └──────────────────────────────────────────────┘")
+    print("  ┌──────────────────────────────────────────────────┐")
+    print("  │ 第一步：关闭 Windows 自带的弹窗（必须做！）       │")
+    print("  └──────────────────────────────────────────────────┘")
     print()
-    print("  Windows 检测到没网时，会自己弹浏览器窗口让你登录。")
-    print("  不关掉这个，脚本认证成功了浏览器还是会弹出来。")
+    print("  Windows 检测到没网时，会自己弹浏览器窗口。")
+    print("  不关掉它，即使脚本认证成功了，浏览器还是会弹出来。")
     print()
-    print("  操作步骤：")
-    print("    1. 右键开始菜单 → Windows PowerShell (管理员)")
-    print("    2. 复制下面这行命令，回车运行：")
+    print("  ▸ 关闭弹窗（以管理员身份打开 PowerShell，运行）：")
     print()
     print("    Set-ItemProperty -Path \"HKLM:\\SYSTEM\\")
     print("    CurrentControlSet\\Services\\NlaSvc\\")
     print("    Parameters\\Internet\" -Name")
     print("    \"EnableActiveProbing\" -Value 0 -Type DWord")
     print()
-    print("    3. 重启电脑（只需一次，以后永久生效）")
+    print("  ▸ 恢复弹窗（如果以后需要恢复，运行下面这个）：")
     print()
-    print("  ┌──────────────────────────────────────────────┐")
-    print("  │ 第二步：部署到 Windows 计划任务               │")
-    print("  └──────────────────────────────────────────────┘")
+    print("    Set-ItemProperty -Path \"HKLM:\\SYSTEM\\")
+    print("    CurrentControlSet\\Services\\NlaSvc\\")
+    print("    Parameters\\Internet\" -Name")
+    print("    \"EnableActiveProbing\" -Value 1 -Type DWord")
     print()
-    print("  让脚本在每天断网前自动启动，断网后几秒内完成重连。")
+    print("  运行后重启电脑即生效（只需一次，永久有效）。")
     print()
-    print("  操作步骤：")
-    print("    1. 右键开始菜单 → Windows PowerShell (管理员)")
-    print("    2. 进入程序所在目录，运行：")
-    print("         .\\setup_task.ps1")
-    print("    3. 默认每天 17:55 启动。要改时间，用记事本打开")
-    print("       setup_task.ps1，找到第 55 行，改 -At 后面的时间：")
-    print("         $trigger = New-ScheduledTaskTrigger -Daily -At \"17:58\"")
-    print("    4. 保存，重新运行 .\\setup_task.ps1")
+    print("  ┌──────────────────────────────────────────────────┐")
+    print("  │ 第二步：确认定时触发时间                         │")
+    print("  └──────────────────────────────────────────────────┘")
     print()
-    print("  ⚠ 定时技巧：")
-    print("    如果学校每天 18:00 踢号断网，就设 17:58 启动。")
-    print("    脚本会提前开始检测，断网瞬间 ~5 秒内自动完成认证。")
+    print(f"  当前设定的触发时间：每天 {stime}")
+    print(f"  建议设到校园网断网前 1-2 分钟，如 {stime_early}。")
+    print("  如需修改，到菜单选 [3] 修改配置 → schedule_time。")
     print()
-    print("  ┌──────────────────────────────────────────────┐")
-    print("  │ 验证是否生效                                 │")
-    print("  └──────────────────────────────────────────────┘")
+    print("  ┌──────────────────────────────────────────────────┐")
+    print("  │ 第三步：部署到 Windows 计划任务（需要管理员）     │")
+    print("  └──────────────────────────────────────────────────┘")
     print()
-    print("  第二天看 logs/ 目录下的日志文件。")
-    print("  如果有 [DOWN] → [AUTH] → [RECOVER] 的记录，")
-    print("  说明无感认证已生效。你什么都没感觉到，网就已经恢复了。")
+    print("  计划任务需要管理员权限，无法在程序内直接创建。")
+    print("  请按以下步骤操作：")
     print()
-    print("  详细说明和 FAQ：https://github.com/suching8848/syxy_auto_verification")
+    print("  1. 按 Win 键 → 输入 PowerShell")
+    print("  2. 右键 Windows PowerShell → 以管理员身份运行")
+    print("  3. 在蓝色窗口里输入以下命令进入程序目录：")
+    path = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else SCRIPT_DIR
+    print(f"       cd \"{path}\"")
+    print("  4. 然后运行部署脚本：")
+    print("       .\\setup_task.ps1")
+    print(f"  5. 看到绿色提示即成功。任务会在每天 {stime} 自动启动。")
     print()
-    print("=" * 62)
+    print("  ⚠ 如果要改触发时间：")
+    print(f"    用记事本打开 setup_task.ps1，找到 -Daily -At")
+    print(f"    把时间改成你想要的（24 小时制，如 17:58），")
+    print("    保存后重新运行 .\\setup_task.ps1 即可。")
     print()
+    print("  ┌──────────────────────────────────────────────────┐")
+    print("  │ 验证是否生效                                     │")
+    print("  └──────────────────────────────────────────────────┘")
+    print()
+    print("  第二天打开 logs/ 目录，看当天日志文件。")
+    print("  如果里面有 [DOWN] → [AUTH] → [RECOVER] 的记录，")
+    print("  说明无感认证已生效。你什么都没感觉到，网就恢复了。")
+    print()
+    print("  项目地址: https://github.com/suching8848/syxy_auto_verification")
+    print("  有详细 README、版本历史、抓包教程、常见问题。")
+    print()
+    print("=" * 66)
+    print()
+
+
+def _shift_time(time_str, minutes_offset):
+    """Shift a HH:MM time string by N minutes, returning HH:MM."""
+    try:
+        parts = time_str.strip().split(":")
+        h, m = int(parts[0]), int(parts[1])
+        total = h * 60 + m + minutes_offset
+        total = total % (24 * 60)
+        return f"{total // 60:02d}:{total % 60:02d}"
+    except (ValueError, IndexError):
+        return time_str
 
 
 def interactive_setup(config):
@@ -427,6 +459,7 @@ def interactive_setup(config):
         ("username", "学号 / 用户名", ""),
         ("password", "校园网密码", ""),
         ("portal_host", "Portal 地址", "http://10.10.200.102"),
+        ("schedule_time", "定时触发时间 (24h制)", "17:55"),
         ("check_url", "网络检测地址", "http://www.baidu.com"),
     ]
 
@@ -643,7 +676,7 @@ def main():
             config = interactive_setup(config)
 
         elif choice == "4":
-            show_seamless_guide()
+            show_seamless_guide(config)
 
         elif choice == "5":
             print()
