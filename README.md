@@ -2,40 +2,58 @@
 
 > **当前版本：v1.3** | 免费开源 | 仅供学习研究使用
 
-校园网断线自动认证工具。定时检测网络状态，检测到 captive portal 后通过后台 HTTP 请求静默完成认证，无需打开浏览器。
+校园网断线自动认证工具。定时检测网络状态，检测到 captive portal 后通过后台 HTTP 请求静默完成认证，**完全无感**——不断网、不弹窗、不影响使用。
 
 ## 工作原理
 
 ```
-启动 → 每 N 秒检测网络状态（GET + 响应内容校验）
-  ├── 网络正常 → 静默等待
-  └── 检测到 portal 劫持 → 提取登录参数 → POST 认证 → 恢复联网
+启动 → 每秒检测网络状态（GET baidu.com + 校验响应内容）
+  ├── 响应含"baidu" → 网络正常 → 等待后继续检测
+  └── 响应不含"baidu" → portal 劫持 → 连续 2 次确认 →
+      提取 JS 跳转参数 → GET index.jsp 拿 Cookie → POST 学号密码 → 认证完成
 ```
 
-**Captive portal 检测**：脚本不只检查网络是否可达，还会校验响应内容是否真的来自目标网站。如果 portal 透明代理了 HTTP 流量（返回登录页冒充目标网站内容），脚本能识别出来。
+**Captive portal 检测**：脚本不只检查网络是否可达，还会校验响应内容是否真的来自 baidu。如果校园网 portal 透明代理了 HTTP 流量（返回登录页冒充 baidu），脚本能从内容识别出来。
 
-**认证方式**：支持三种模式，按 portal 类型选择：
+**认证方式**：支持三种模式：
 
 | 模式 | 适用场景 | 原理 |
 |---|---|---|
-| `portal_post` | 需要 POST 用户名密码的校园网 portal | GET 触发 JS 跳转 → 提取登录参数 → POST 认证 |
-| `http` | portal 只需访问特定 URL 即可续期 | 后台 GET 请求 portal URL |
-| `browser` | portal 必须交互才能登录 | 打开浏览器 + 模拟 Enter 按键 |
+| `portal_post`（默认） | 需要 POST 用户名密码的校园网 | 提取 JS 跳转参数 → 后台 POST 登录 |
+| `http` | portal 只需访问特定 URL 续期 | 后台 GET 请求 portal URL |
+| `browser` | portal 必须交互才能登录 | 打开浏览器 + 模拟 Enter |
 
 ## 文件说明
 
 ```
-auto_login.py          # 主程序
-auto_login_config.json # 配置文件
-setup_task.ps1         # 一键部署到 Windows 计划任务
-logs/                  # 运行日志（按日期，自动清理 7 天前）
+auto_login.py               # 主程序
+auto_login_config.json      # 配置文件（含密码，不提交 git）
+auto_login_config.example.json  # 配置模板（可提交）
+setup_task.ps1              # 一键部署到 Windows 计划任务
+run_hidden.vbs              # 无窗口启动器（计划任务用）
+logs/                       # 运行日志（按日期，自动清理 7 天前）
 ```
 
 ## 快速开始
 
-### 1. 编辑配置
+### 1. 获取程序
 
-编辑 `auto_login_config.json`，填入你的校园网账号信息：
+**方式 A：下载 exe（推荐，无需安装 Python）**
+
+从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.3.zip`，解压到任意文件夹。
+
+**方式 B：运行 Python 脚本**
+
+```bash
+git clone https://github.com/suching8848/syxy_auto_verification.git
+cd syxy_auto_verification
+```
+
+### 2. 配置
+
+**exe 用户**：双击 `auto_login.exe`，程序会自动检测配置缺失并弹出配置向导，按提示输入学号和密码即可。
+
+**Python 用户**：将 `auto_login_config.example.json` 重命名为 `auto_login_config.json`，用记事本打开编辑：
 
 ```json
 {
@@ -54,244 +72,229 @@ logs/                  # 运行日志（按日期，自动清理 7 天前）
 }
 ```
 
-> `portal_url` 填校园网认证页面的地址，浏览器手动登录时看地址栏就能找到。
+> `portal_url` 默认已填三亚学院认证地址，一般不需要改。如果换学校了才需要改。
 
-### 2. 手动测试
+### 3. 测试
 
 ```powershell
-# 测试认证是否成功（跳过网络检测，直接发一次认证）
+# exe 用户：双击后菜单选 [2]
+# Python 用户：
 python auto_login.py --auth
-
-# 完整运行（网络检测 + 断网自动认证）
-python auto_login.py
 ```
 
-按 `Ctrl+C` 停止。
+看到 `Auth test PASSED` 说明配置正确。
 
-### 3. 部署到计划任务
+### 4. 实现无感（关弹窗 + 计划任务）
 
-以管理员身份运行 PowerShell：
+要实现**完全无感**（断网 → 自动认证 → 恢复，全程不弹任何窗口），需要做两件事：
 
-```powershell
-.\setup_task.ps1
-```
+**① 关闭 Windows 自动弹窗（必须）**
 
-创建 `CampusNetAutoLogin` 任务，每天 17:55 自动启动，运行 60 分钟。
-
-**调整触发时间：** 如果校园网在固定时间断网（比如每天 18:00），编辑 `setup_task.ps1` 第 55 行把时间改到断网前一两分钟：
-
-```powershell
-$trigger = New-ScheduledTaskTrigger -Daily -At "17:58"
-```
-
-重新运行 `.\setup_task.ps1` 即可。
-
-### 4. 关闭 Windows 自动弹窗
-
-Windows 会自己检测 captive portal 然后弹浏览器窗口。部署计划任务前需要关掉这个行为，否则每次断网都会弹窗：
-
-以管理员身份运行 PowerShell：
+以管理员身份打开 PowerShell，运行：
 
 ```powershell
 Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet" -Name "EnableActiveProbing" -Value 0 -Type DWord
 ```
 
-重启电脑或重新连接网络后生效。从此认证由脚本在后台静默完成，不会弹出任何窗口。
+重启电脑生效。**恢复方法**：把 `-Value 0` 改成 `-Value 1` 再运行一次。
 
-### 5. 移除
+**② 部署计划任务**
+
+以管理员身份打开 PowerShell，进入程序所在目录，运行：
+
+```powershell
+.\setup_task.ps1
+```
+
+每天 17:55 自动启动，运行 10 分钟后自动退出。修改时间编辑 `setup_task.ps1` 第 85 行：
+
+```powershell
+$trigger = New-ScheduledTaskTrigger -Daily -At "你的时间"
+```
+
+exe 用户通过 `run_hidden.vbs` 启动，计划任务**完全无窗口**。
+
+### 5. 取消计划任务
 
 ```powershell
 Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 ```
+
+## exe 菜单说明
+
+双击 `auto_login.exe` 后显示交互菜单：
+
+```
+══════════════════════════════════════════════════════
+  校园网自动认证工具 v1.3
+  项目: https://github.com/suching8848/syxy_auto_verification
+──────────────────────────────────────────────────────
+  程序目录: C:\Users\xxx\Desktop\校园网认证
+──────────────────────────────────────────────────────
+  [1] 启动自动认证  — 后台检测 + 断网自动重连
+  [2] 测试认证      — 发一次请求验证配置是否正确
+  [3] 修改配置      — 学号 / 密码 / 认证地址
+  [4] 无感部署指南  — 关弹窗 + 计划任务（实现完全无感）
+  [5] 使用帮助      — 完整说明和常见问题
+  [q] 退出
+──────────────────────────────────────────────────────
+```
+
+- **[1] 启动自动认证**：开始循环检测，窗口关闭即停止。每 1 秒检测一次，发现断网 5 秒内完成认证
+- **[4] 无感部署指南**：手把手教你怎么关弹窗、设计划任务，菜单直接显示可复制的目录路径
+- **[5] 使用帮助**：FAQ，涵盖配置文件、认证失败、闪退等常见问题
 
 ## 全部配置项
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `auth_method` | `"portal_post"` | 认证模式：`"portal_post"` / `"http"` / `"browser"` |
-| `check_url` | `http://www.baidu.com` | 用于检测网络的地址（建议用 HTTP，HTTPS 无法被 portal 劫持检测） |
-| `check_expected_body` | `"baidu"` | 响应内容必须包含此关键词，否则判定为 portal 劫持 |
-| `check_interval_ok` | `1` | 网络正常时的检测间隔（秒） |
-| `check_interval_fail` | `5` | 断网/portal 模式下的检测间隔（秒） |
+| `check_url` | `http://www.baidu.com` | 检测网络用的地址（HTTP，HTTPS 无法被 portal 劫持） |
+| `check_expected_body` | `"baidu"` | 响应内容必须包含的关键词，否则判定为 portal 劫持 |
+| `check_interval_ok` | `1` | 网络正常时检测间隔（秒） |
+| `check_interval_fail` | `5` | 断网/portal 模式下检测间隔（秒） |
 | `fail_threshold` | `2` | 连续失败多少次后触发认证 |
 | `request_timeout` | `5` | HTTP 请求超时（秒） |
-| `run_duration_minutes` | `10` | 运行多久后自动退出，`0` 为无限 |
+| `run_duration_minutes` | `10` | 运行多久自动退出，`0` 为无限 |
 | `auth_cooldown_seconds` | `30` | 两次认证的最小间隔，防止频繁认证 |
 
-**portal_post 模式额外字段：**
+**portal_post 模式字段：**
 
 | 字段 | 说明 |
 |---|---|
-| `portal_url` | Portal 认证地址（portal_post 模式填基地址如 `http://10.10.200.102`，http 模式填完整续期 URL） |
+| `portal_url` | 校园网认证服务器地址（默认三亚学院 `http://10.10.200.102`） |
 | `username` | 校园网用户名 / 学号 |
 | `password` | 校园网密码 |
+| `schedule_time` | 计划任务触发时间（24h 制，默认 `17:55`） |
 
-**http 模式额外字段：**
-
-| 字段 | 说明 |
-|---|---|
-| `portal_url` | 认证续期 URL（如 `success.jsp?userIndex=...`） |
-
-**browser 模式额外字段：**
+**http / browser 模式字段：**
 
 | 字段 | 默认值 | 说明 |
 |---|---|---|
-| `portal_url` | (必填) | 在浏览器中打开的认证页面 |
-| `browser_wait_seconds` | `3` | 打开浏览器后等待多久再模拟 Enter |
+| `portal_url` | (必填) | http 模式填完整续期 URL；browser 模式填认证页面 |
+| `browser_wait_seconds` | `3` | 仅 browser 模式：打开浏览器后等多久模拟 Enter |
 
-## 三种认证模式详解
+## 认证流程详解
 
-### portal_post — 后台 POST 登录（推荐）
+### portal_post（默认，推荐）
 
-适用于需要提交用户名密码的大多数校园网 portal。
+适用于需要提交用户名密码的校园网 portal（如三亚学院深澜系统）。
 
-**认证流程：**
-
-1. GET `check_url`（如 baidu.com）→ portal 返回含 JS 跳转的页面
+1. GET `check_url` → portal 返回含 JS 跳转的页面（`location.href='index.jsp?...'`）
 2. 正则提取 index.jsp 完整 URL（含 `wlanuserip`、`nasip`、`mac` 等连接参数）
 3. GET index.jsp → 拿到 `JSESSIONID` cookie
-4. POST `InterFace.do?method=login`，携带用户名、密码、连接参数、cookie
-5. 认证完成，网络恢复
+4. POST `InterFace.do?method=login`，携带用户名、密码、queryString、cookie
+5. Portal 返回 `result:success` → 认证完成
 
-全程在后台通过 HTTP 请求完成，无浏览器窗口。
+全程后台 HTTP 请求，不弹浏览器。
 
 ### http — 后台 GET 续期
 
-适用于访问特定 URL 即可完成续期的 portal 系统（如 `success.jsp`）。
-
-- 后台 GET 请求 `portal_url`
-- 带浏览器 User-Agent，模拟真实浏览器
-- 不需要提交用户名密码
-
-**注意**：如果 portal 采用透明代理（不改变 URL）而非 HTTP 重定向，需要配置 `check_expected_body` 来检测 portal 劫持。
+适用于访问 `success.jsp` 即可续期的 portal。后台 GET 请求 `portal_url`，带浏览器 UA。
 
 ### browser — 浏览器交互
 
-适用于 portal 必须手动交互（验证码、选择运营商等）的情况。
-
-- 打开默认浏览器访问 `portal_url`
-- 等待指定秒数后模拟 Enter 按键
-- 计划任务必须使用 `LogonType Interactive`（`setup_task.ps1` 已默认配置）
+适用于必须手动交互的 portal。打开浏览器访问 `portal_url`，等待后模拟 Enter 按键。计划任务需要 `LogonType Interactive`。
 
 ## 运行效果
 
-### 手动运行（交互模式）
+### 手动运行（`python auto_login.py`）
 
-`python auto_login.py` 自动识别为交互模式，每轮检测输出 STATUS 行：
+交互模式每轮检测输出 STATUS 行：
 
 ```
 [22:01:06] [START] Service started [interactive]
-[22:01:06] [INFO] Config: auth=portal_post check=http://www.baidu.com interval=15s threshold=2 duration=60min
 [22:01:06] [WARN] Check #1 failed: response missing 'baidu' (portal injected?)
-[22:01:06] [STATUS] [WARN] check failed 1/2 | next in 15s | uptime 0s | checks #1
-[22:01:21] [DOWN] Network DOWN (reason: response missing 'baidu' (portal injected?)), starting auth
-[22:01:21] [AUTH] Portal JS redirect: http://10.10.200.102/eportal/index.jsp?wlanuserip=...
-[22:01:22] [AUTH] Auth OK [HTTP 200, 28ms] body: {"userIndex":"...","result":"success",...}
-[22:01:22] [STATUS] [DOWN] outage 1s | auth #2 | next in 10s | uptime 16s | checks #2
-[22:01:32] [RECOVER] Network restored — outage: 16s, checks: 3, auth_attempts: 1
-[22:01:32] [STATUS] [OK]  reachable | next in 15s | uptime 26s | checks #3
+[22:01:06] [STATUS] [WARN] check failed 1/2 | next in 1s | uptime 0s | checks #1
+[22:01:07] [DOWN] Network DOWN (reason: response missing 'baidu'), starting auth
+[22:01:07] [AUTH] Portal JS redirect: http://10.10.200.102/eportal/index.jsp?wlanuserip=...
+[22:01:08] [AUTH] Auth OK [HTTP 200, 28ms] body: {"userIndex":"...","result":"success",...}
+[22:01:13] [RECOVER] Network restored — outage: 6s, checks: 3, auth_attempts: 1
+[22:01:13] [STATUS] [OK]  reachable | next in 1s | uptime 7s | checks #4
 ```
 
-### 测试认证（--auth 模式）
+### 测试认证（`--auth`）
 
 ```powershell
 python auto_login.py --auth
 ```
 
-直接发一次认证请求并退出，不启动网络检测循环。用于验证配置是否正确。
+直接发一次认证请求并退出，不启动检测循环。用于验证配置。
 
 ### 后台运行（计划任务）
 
-通过 `pythonw.exe` + 计划任务运行时，自动识别为后台模式，只记录关键事件，不输出 STATUS 行。
+通过计划任务 + `run_hidden.vbs` 启动，无任何窗口。只记录关键事件（DOWN/AUTH/RECOVER/STOP），不输出 STATUS 行。日志在 `logs/` 目录。
 
-## 附录：抓取 portal 的 login API（换学校 / portal 不兼容时）
+## 分发给别人
 
-如果你的 portal 地址不同，或者默认的 `InterFace.do?method=login` 流程不适用，需要从浏览器抓包确认 login API：
-
-**用命令行启动 Chrome/Edge（强制所有窗口带 DevTools）：**
+打包成单个 exe，对方不需要装 Python：
 
 ```powershell
-Start-Process chrome -ArgumentList "--auto-open-devtools-for-tabs", "http://www.baidu.com"
-# 或
-Start-Process msedge -ArgumentList "--auto-open-devtools-for-tabs", "http://www.baidu.com"
-```
-
-1. DevTools → **Network** 标签，勾选 **Preserve log**
-2. 在认证页面输入账号密码登录
-3. 登录成功后，找 Network 列表里 Method 为 **POST** 的请求（通常是 `InterFace.do?method=login`）
-4. 点 **Payload** 标签，确认表单字段名（`userId`、`password` 等），如果字段名不同需要改脚本 `do_auth_portal_post()` 中的 form_data
-5. 从地址栏或请求 URL 中提取认证地址填入 `portal_url`
-
-然后把抓到的信息填入配置即可。
-
-## 分发给别人（无需安装 Python）
-
-打包成单个 exe，对方不需要装 Python，双击即可使用：
-
-```powershell
-# 构建（需要先 pip install pyinstaller）
+pip install pyinstaller
 pyinstaller --onefile --console --name auto_login auto_login.py
 ```
 
-构建产物在 `dist/auto_login.exe`。分发给别人时，把 `auto_login.exe` 和一份 `auto_login_config.example.json` 放在同一目录即可。
-
-### 电脑小白使用流程
-
-1. 把 `auto_login_config.example.json` 重命名为 `auto_login_config.json`
-2. 双击 `auto_login.exe`
-3. 程序会自动检测配置未完成，引导填写学号、密码
-4. 菜单选 `[2]` 快速测试认证
-5. 测试通过后，菜单选 `[1]` 启动自动认证
-6. 按 `[4]` 查看使用指南，了解如何关闭 Windows 弹窗和部署计划任务
-
-**exe 内置了完整的菜单系统**，不用记命令行参数：
+分发给别人需要的文件（已打包在 `auto_login_v1.3.zip`）：
 
 ```
-  [1] 启动自动认证  — 后台检测 + 断网自动重连
-  [2] 测试认证      — 发一次请求验证配置是否正确
-  [3] 修改配置      — 学号 / 密码 / Portal 地址
-  [4] 无感部署指南  — 关弹窗 + 计划任务（实现完全无感）
-  [5] 使用帮助      — 完整说明和常见问题
-  [q] 退出
+auto_login.exe              # 主程序
+auto_login_config.example.json  # 配置模板
+setup_task.ps1              # 计划任务部署脚本
+run_hidden.vbs              # 无窗口启动器
 ```
+
+对方解压后双击 exe 即可，配置向导会引导完成设置。
+
+## 附录：不兼容的 portal 怎么办
+
+如果你的学校 portal 认证流程不同，需要从浏览器抓包确认 login API：
+
+```powershell
+# 用命令行启动 Chrome，强制所有窗口带 DevTools
+Start-Process chrome -ArgumentList "--auto-open-devtools-for-tabs", "http://www.baidu.com"
+```
+
+1. DevTools → **Network** 标签，勾选 **Preserve log**
+2. 在弹出的认证页输入账号密码登录
+3. 找 Network 列表中 Method 为 **POST** 的请求
+4. 点 **Payload** 标签，确认表单字段名和 API 路径
+5. 如果字段名或路径与默认的不同，需要修改脚本 `do_auth_portal_post()` 中的 form_data
 
 ## 版本历史
 
 ### v1.3 (2026-05-13)
 
-- 统一配置项：`portal_host` 合并为 `portal_url`，消除混淆
-- 配置向导优化：去掉"如"前缀，标签简洁清晰，通用示例值
-- 启动认证增加提示：窗口关闭即停止，引导用户部署计划任务
-- 无感部署指南：恢复弹窗命令、通用路径描述、手把手 PowerShell 步骤
-- 新增 `schedule_time` 配置项，向导中可设定时时间
-- 菜单新增 [4] 无感部署指南、[5] 使用帮助 FAQ
+- 默认 `auth_method` 改为 `portal_post`，默认三亚学院认证地址
+- `portal_host` 统一为 `portal_url`，消除两个字段的混淆
+- 新增 `run_hidden.vbs` 无窗口启动器，计划任务真正零弹窗
+- `setup_task.ps1` 自动检测 exe，优先用 VBS 模式 + `Hidden=$true`
+- 菜单显示程序目录路径，无感部署指南可一键复制
+- portal_post 模式检查返回 JSON 中的 `result:fail`，避免误报
+- http 模式增加响应内容 fail/error 检测
+- 默认参数优化：检测间隔 1s、重试 5s、运行 10min
+- 配置向导去掉"如"前缀，示例值全部通用化
+- 菜单新增 [4] 无感部署指南（含恢复弹窗命令）、[5] FAQ 帮助
+- 启动认证前提示"窗口关闭即停止"
 
 ### v1.2 (2026-05-12)
 
-- 新增交互式菜单系统：启动认证 / 测试认证 / 修改配置 / 使用指南，无需记命令行
-- 新增首次配置向导：自动检测未完成的配置，引导填写学号、密码、Portal 地址
-- 新增嵌入式使用指南：包含关闭 Windows 弹窗、定时建议、配置文件说明等保姆级教程
+- 新增交互式菜单系统：启动 / 测试 / 配置 / 指南，无需命令行
+- 新增首次配置向导：自动检测未完成，引导填写学号密码
+- 新增嵌入式使用指南：关弹窗、定时建议、配置文件说明
 - 优化 exe 体验：配置未完成自动提示，菜单循环不闪退
 
 ### v1.1 (2026-05-12)
 
-- 新增 `portal_post` 认证模式：自动提取 portal 的 JS 跳转参数，后台 POST 用户名密码完成认证
-- 新增 captive portal 透明代理检测：校验响应内容关键词 + 正则提取 JS 跳转 URL
-- 新增 `--auth` 测试命令：直接发一次认证请求，用于验证配置是否正确
-- 新增 `--version` 版本信息
-- 新增 `check_expected_body` 配置项
-- 支持 PyInstaller 打包成独立 exe，无需安装 Python
-- 修复 PyInstaller 打包后路径检测问题
-- 双击 exe 运行完自动暂停，不会闪退
+- 新增 `portal_post` 认证模式：JS 跳转提取 + 后台 POST 登录
+- 新增 captive portal 透明代理检测：内容校验 + 正则提取
+- 新增 `--auth` / `--version` 命令、`check_expected_body` 配置
+- 支持 PyInstaller 打包成独立 exe
 
 ### v1.0 (初始版本)
 
-- `http` 模式：后台 GET 请求 portal URL 续期
-- `browser` 模式：打开浏览器 + 模拟 Enter
-- 网络检测：HEAD 请求 check_url 判断连通性
-- Windows 计划任务部署（setup_task.ps1）
-- 交互 / 后台双模式自动识别
-- 按日期日志 + 7 天自动清理
+- `http` 和 `browser` 两种认证模式
+- HEAD 请求网络检测、Windows 计划任务部署
+- 交互 / 后台双模式、按日期日志 + 7 天清理
 
 ## 免责声明
 
@@ -304,4 +307,4 @@ pyinstaller --onefile --console --name auto_login auto_login.py
 
 - Python 3（仅标准库，无需 pip 安装）
 - Windows 10/11
-- （如打包成 exe，则无需任何依赖）
+- （exe 版本无需任何依赖）
