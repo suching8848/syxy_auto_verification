@@ -40,12 +40,12 @@ logs/                  # 运行日志（按日期，自动清理 7 天前）
 ```json
 {
     "check_url": "http://www.baidu.com",
-    "check_interval_ok": 15,
-    "check_interval_fail": 10,
+    "check_interval_ok": 1,
+    "check_interval_fail": 5,
     "fail_threshold": 2,
     "request_timeout": 5,
     "auth_method": "portal_post",
-    "run_duration_minutes": 60,
+    "run_duration_minutes": 10,
     "auth_cooldown_seconds": 30,
     "check_expected_body": "baidu",
     "portal_url": "http://10.10.200.102",
@@ -111,11 +111,11 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 | `auth_method` | `"http"` | 认证模式：`"http"` / `"browser"` / `"portal_post"` |
 | `check_url` | `http://www.baidu.com` | 用于检测网络的地址（建议用 HTTP，HTTPS 无法被 portal 劫持检测） |
 | `check_expected_body` | `"baidu"` | 响应内容必须包含此关键词，否则判定为 portal 劫持 |
-| `check_interval_ok` | `30` | 网络正常时的检测间隔（秒） |
-| `check_interval_fail` | `10` | 断网/portal 模式下的检测间隔（秒） |
+| `check_interval_ok` | `1` | 网络正常时的检测间隔（秒） |
+| `check_interval_fail` | `5` | 断网/portal 模式下的检测间隔（秒） |
 | `fail_threshold` | `2` | 连续失败多少次后触发认证 |
 | `request_timeout` | `5` | HTTP 请求超时（秒） |
-| `run_duration_minutes` | `60` | 运行多久后自动退出，`0` 为无限 |
+| `run_duration_minutes` | `10` | 运行多久后自动退出，`0` 为无限 |
 | `auth_cooldown_seconds` | `30` | 两次认证的最小间隔，防止频繁认证 |
 
 **portal_post 模式额外字段：**
