@@ -11,13 +11,24 @@ import glob
 import ctypes
 import argparse
 import re
+import socket
+import threading
 from datetime import datetime, timedelta
 
 if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "v1.3"
+VERSION = "v1.4"
+
+# Required on Windows 11 for tray icon to appear — set before any window creation
+try:
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+        "CampusNetwork.AutoLogin.Tray"
+    )
+except Exception:
+    pass
+
 DISCLAIMER = (
     f"Campus Network Auto-Login {VERSION}\n"
     "仅供学习研究使用，请勿用于非法用途。\n"
@@ -34,8 +45,8 @@ MAX_LOG_DAYS = 7
 DEFAULT_CONFIG = {
     "portal_url": "http://10.10.200.102",
     "check_url": "http://www.baidu.com",
-    "check_interval_ok": 1,
-    "check_interval_fail": 5,
+    "check_interval_ok": 5,
+    "check_interval_fail": 2,
     "fail_threshold": 2,
     "request_timeout": 5,
     "auth_method": "portal_post",
@@ -87,8 +98,10 @@ def load_config():
 def log(msg, level="INFO"):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{timestamp}] [{level}] {msg}"
-    print(line, flush=True)
-
+    try:
+        print(line, flush=True)
+    except Exception:
+        pass  # stdout may be broken (pythonw.exe)
     try:
         with open(get_log_path(), "a", encoding="utf-8") as f:
             f.write(line + "\n")
@@ -162,6 +175,85 @@ BROWSER_HEADERS = {
 }
 
 
+# ── Windows System Tray API (ctypes, no external deps) ──────────────────────
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+class _MSG(ctypes.Structure):
+    _fields_ = [("hwnd", ctypes.c_void_p), ("message", ctypes.c_uint),
+                ("wParam", ctypes.c_void_p), ("lParam", ctypes.c_void_p),
+                ("time", ctypes.c_uint), ("pt", _POINT)]
+
+class _NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint), ("hwnd", ctypes.c_void_p), ("uID", ctypes.c_uint),
+        ("uFlags", ctypes.c_uint), ("uCallbackMessage", ctypes.c_uint),
+        ("hIcon", ctypes.c_void_p), ("szTip", ctypes.c_wchar * 128),
+        ("dwState", ctypes.c_uint), ("dwStateMask", ctypes.c_uint),
+        ("szInfo", ctypes.c_wchar * 256), ("uTimeout", ctypes.c_uint),
+        ("szInfoTitle", ctypes.c_wchar * 64), ("dwInfoFlags", ctypes.c_uint),
+        ("guidItem", ctypes.c_ubyte * 16), ("hBalloonIcon", ctypes.c_void_p),
+    ]
+
+class _WNDCLASSEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.c_uint), ("style", ctypes.c_uint),
+        ("lpfnWndProc", ctypes.c_void_p), ("cbClsExtra", ctypes.c_int),
+        ("cbWndExtra", ctypes.c_int), ("hInstance", ctypes.c_void_p),
+        ("hIcon", ctypes.c_void_p), ("hCursor", ctypes.c_void_p),
+        ("hbrBackground", ctypes.c_void_p), ("lpszMenuName", ctypes.c_wchar_p),
+        ("lpszClassName", ctypes.c_wchar_p), ("hIconSm", ctypes.c_void_p),
+    ]
+
+# Shell_NotifyIcon actions
+NIM_ADD        = 0x00000000
+NIM_MODIFY     = 0x00000001
+NIM_DELETE     = 0x00000002
+NIM_SETVERSION = 0x00000004
+NOTIFYICON_VERSION_4 = 4
+
+# NIF flags
+NIF_MESSAGE = 0x00000001
+NIF_ICON    = 0x00000002
+NIF_TIP     = 0x00000004
+
+# System icon IDs
+IDI_INFORMATION = 32513
+
+# Menu flags
+TPM_RETURNCMD  = 0x0100
+TPM_RIGHTBUTTON = 0x0002
+MF_STRING      = 0x0000
+MF_GRAYED      = 0x0003
+MF_SEPARATOR   = 0x0800
+
+# Custom window messages
+WM_USER              = 0x0400
+WM_APP               = 0x8000
+WM_TRAY_CALLBACK     = WM_APP + 1
+WM_USER_TRAY_UPDATE  = WM_USER + 1
+
+# Menu command IDs
+CMD_STATUS_SHOW   = 1
+CMD_EXIT          = 2
+CMD_TOGGLE_CONSOLE = 3
+TRAY_ICON_ID      = 1
+
+# ── Set explicit 64-bit argtypes for Win32 functions used by TrayApp ─────────
+_user32 = ctypes.windll.user32
+_user32.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_ulonglong, ctypes.c_ulonglong]
+_user32.DefWindowProcW.restype = ctypes.c_longlong
+_user32.GetMessageW.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint, ctypes.c_uint]
+_user32.GetMessageW.restype = ctypes.c_int
+_user32.DispatchMessageW.argtypes = [ctypes.c_void_p]
+_user32.DispatchMessageW.restype = ctypes.c_longlong
+_user32.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_ulonglong, ctypes.c_ulonglong]
+_user32.PostMessageW.restype = ctypes.c_int
+
+# ── End of Tray API definitions ─────────────────────────────────────────────
+
+
 def do_auth_portal_post(config):
     """POST-based campus portal auth.
     Step 0: try to trigger portal redirect by accessing check_url (full browser headers)
@@ -205,20 +297,65 @@ def do_auth_portal_post(config):
     except Exception as e:
         log(f"Probe {check_url}: {e}", "AUTH")
 
+    # Step 0.5: if already online (no redirect), try logout to force captive portal re-trigger
+    if not index_url:
+        log("Already online — trying logout APIs to trigger captive portal...", "AUTH")
+        for logout_method in ("logout", "offline", "disconnect"):
+            try:
+                logout_url = f"{portal_host}/eportal/InterFace.do?method={logout_method}"
+                req = urllib.request.Request(logout_url, headers={
+                    "User-Agent": BROWSER_UA,
+                    "Referer": f"{portal_host}/eportal/index.jsp",
+                })
+                resp = opener.open(req, timeout=timeout)
+                body = resp.read(204800).decode("utf-8", errors="ignore")
+                log(f"Logout '{logout_method}': {body[:200]}", "AUTH")
+                # if logout succeeded (or user already offline), re-probe for portal redirect
+                if any(kw in body for kw in ["成功", "success", "已不在线", "已下线", "下线成功"]):
+                    log("Logout OK, re-probing network for captive portal...", "AUTH")
+                    time.sleep(2)
+                    try:
+                        req2 = urllib.request.Request(check_url, headers=BROWSER_HEADERS)
+                        resp2 = opener.open(req2, timeout=timeout)
+                        body2 = resp2.read(204800).decode("utf-8", errors="ignore")
+                        final2 = resp2.geturl()
+                        if final2 != check_url and "index.jsp" in final2:
+                            index_url = final2
+                            log(f"Got redirect after logout: {index_url[:150]}", "AUTH")
+                        else:
+                            m2 = re.search(r"location\.href\s*=\s*['\"]([^'\"]*index\.jsp[^'\"]*)", body2)
+                            if m2:
+                                index_url = m2.group(1)
+                                log(f"Got JS redirect after logout: {index_url[:150]}", "AUTH")
+                            else:
+                                log("No portal redirect after logout — portal logout may be unreliable", "AUTH")
+                    except Exception as e2:
+                        log(f"Re-probe after logout failed: {e2}", "AUTH")
+                    break  # stop trying other logout methods
+            except Exception as e:
+                log(f"Logout '{logout_method}' error: {e}", "AUTH")
+
     # Step 1: if no JS redirect found, try accessing portal directly
     if not index_url:
         index_url = f"{portal_host}/eportal/index.jsp"
         log(f"No JS redirect, accessing portal directly: {index_url}", "AUTH")
 
     # GET index.jsp to obtain JSESSIONID cookie (needed for both paths)
+    index_body = ""
     try:
         req = urllib.request.Request(index_url, headers={"User-Agent": BROWSER_UA})
         resp = opener.open(req, timeout=timeout)
-        resp.read(204800)
+        index_body = resp.read(204800).decode("utf-8", errors="ignore")
         final_url = resp.geturl()
         if final_url != index_url:
             index_url = final_url
             log(f"Portal responded with: {index_url[:150]}...", "AUTH")
+        # scan body for JS redirect (same as Step 0, but for index page)
+        if not urlparse(index_url).query:
+            m = re.search(r"location\.href\s*=\s*['\"]([^'\"]*index\.jsp[^'\"]*)", index_body)
+            if m:
+                index_url = m.group(1)
+                log(f"Found JS redirect in index page: {index_url[:150]}...", "AUTH")
     except Exception as e:
         log(f"Failed to fetch index page: {e}", "ERROR")
         return False
@@ -237,7 +374,6 @@ def do_auth_portal_post(config):
                 resp = opener.open(req, timeout=timeout)
                 api_body = resp.read(204800).decode("utf-8", errors="ignore")
                 log(f"API {api_method} response: {api_body[:200]}", "AUTH")
-                # Some portals return queryString in JSON or as redirect
                 final_url = resp.geturl()
                 if final_url != api_url and "index.jsp" in final_url:
                     index_url = final_url
@@ -247,8 +383,36 @@ def do_auth_portal_post(config):
             except Exception as e:
                 log(f"API {api_method} failed: {e}", "AUTH")
 
+    # Step 1.6: extract params from index page body (hidden inputs / JS vars)
+    if not query_string and index_body:
+        # try hidden inputs: <input name="wlanuserip" value="10.1.2.3"/>
+        params = re.findall(r'<input[^>]*name=["\'](wlan\w+|\w+ip|nas\w*|mac)["\'][^>]*value=["\']([^"\']*)["\']',
+                            index_body, re.IGNORECASE)
+        if params:
+            query_string = "&".join(f"{k}={v}" for k, v in params)
+            log(f"Extracted params from page body: {query_string[:200]}", "AUTH")
+        else:
+            # try JS vars: var wlanuserip = "10.1.2.3";
+            js_params = re.findall(r'(?:var|let|const)\s+(wlan\w+|\w+ip|nas\w*|mac)\s*=\s*["\']([^"\']+)["\']',
+                                   index_body, re.IGNORECASE)
+            if js_params:
+                query_string = "&".join(f"{k}={v}" for k, v in js_params)
+                log(f"Extracted JS params from page body: {query_string[:200]}", "AUTH")
+
+    # Step 1.7: last resort — construct minimal queryString from local IP
     if not query_string:
-        log("Still no query parameters — portal may not support this flow", "AUTH")
+        try:
+            parsed = urlparse(portal_host)
+            host = parsed.hostname or portal_host
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(2)
+            s.connect((host, 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            query_string = f"wlanuserip={local_ip}"
+            log(f"Fallback queryString: {query_string}", "AUTH")
+        except Exception as e:
+            log(f"Could not construct queryString: {e}", "AUTH")
 
     form_data = urlencode({
         "userId": username,
@@ -510,27 +674,276 @@ def show_menu():
     print("-" * 62)
     print(f"  程序目录: {current_dir}")
     print("-" * 62)
-    print("  [1] 启动自动认证  — 后台检测 + 断网自动重连")
-    print("  [2] 测试认证      — 发一次请求验证配置是否正确")
-    print("  [3] 修改配置      — 学号 / 密码 / 认证地址")
-    print("  [4] 无感部署指南  — 关弹窗 + 计划任务（实现完全无感）")
-    print("  [5] 使用帮助      — 完整说明和常见问题")
+    print("  [1] 启动自动认证")
+    print("      持续检测网络状态，断网时自动重新登录")
+    print("      适合：临时使用，关闭窗口即停止")
+    print()
+    print("  [2] 测试认证")
+    print("      发送一次认证请求，验证账号密码是否正确")
+    print("      适合：首次使用前确认配置无误")
+    print()
+    print("  [3] 修改基本配置")
+    print("      修改学号、密码、认证地址等常用项")
+    print("      如需修改检测间隔等高级参数，直接编辑配置文件：")
+    print(f"      {os.path.join(current_dir, 'auto_login_config.json')}")
+    print()
+    print("  [4] 定时部署")
+    print("      已知每天断网时间 → 设置 Windows 计划任务定时触发")
+    print("      适合：校园网每天固定时间断网（如每晚 17:55）")
+    print()
+    print("  [5] 后台常驻")
+    print("      不知道断网时间 → 托盘图标常驻后台，断网自动重连")
+    print("      终端窗口消失，仅通知区域留一个蓝色 i 图标")
+    print("      资源占用极低（CPU ~0%，内存 ~20MB），不影响电脑性能")
+    print("      适合：断网时间不固定，或需要全天候自动认证")
+    print()
+    print("  [6] 使用帮助")
+    print("      FAQ 常见问题：认证失败、闪退、日志在哪等")
+    print()
     print("  [q] 退出")
     print("-" * 62)
     choice = _input("  请选择: ").strip().lower()
     return choice or "1"
 
 
-def run_detection_loop(config):
-    """Core detection loop — runs until stopped or duration exceeded."""
+# ── System Tray Application Class ────────────────────────────────────────────
+
+class TrayApp:
+    """Hidden window + notification area icon for background operation.
+    Uses ctypes to call Win32 Shell_NotifyIcon API — zero external dependencies."""
+
+    def __init__(self, config, start_hidden=False):
+        self._config = config
+        self._stop_event = threading.Event()
+        self._worker = None
+        self._status = "Initializing..."
+        self._hwnd = None
+        self._hinst = ctypes.windll.kernel32.GetModuleHandleW(None)
+        self._wnd_proc_cb = None
+        self._title = f"Campus Network Auto-Login {VERSION}"
+        self._start_hidden = start_hidden
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def run(self):
+        """Entry point. Creates window + tray icon, starts worker, enters message loop."""
+        try:
+            self._create_window()
+            self._create_tray_icon()
+        except Exception as e:
+            log(f"Tray init failed: {e}, falling back to console", "ERROR")
+            run_detection_loop(self._config)
+            return
+
+        # hide console initially if requested
+        if self._start_hidden:
+            self._hide_console()
+
+        self._worker = threading.Thread(target=self._detection_worker, daemon=True)
+        self._worker.start()
+        self._message_loop()
+        self._cleanup()
+
+    # ── console show/hide ─────────────────────────────────────────────────
+
+    def _hide_console(self):
+        """Hide the console/terminal window — use EnumWindows to catch parent terminal."""
+        console = ctypes.windll.kernel32.GetConsoleWindow()
+        if console:
+            ctypes.windll.user32.ShowWindow(console, 0)
+
+        pid = os.getpid()
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def _enum_cb(hwnd, _lp):
+            wpid = ctypes.c_ulong()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+            if wpid.value == pid and ctypes.windll.user32.IsWindowVisible(hwnd):
+                ctypes.windll.user32.ShowWindow(hwnd, 0)
+            return True
+        ctypes.windll.user32.EnumWindows(_enum_cb, 0)
+
+    def _show_console(self):
+        """Restore the console/terminal window."""
+        console = ctypes.windll.kernel32.GetConsoleWindow()
+        if console:
+            ctypes.windll.user32.ShowWindow(console, 5)  # SW_SHOW
+            ctypes.windll.user32.SetForegroundWindow(console)
+
+    # ── window creation ───────────────────────────────────────────────────
+
+    def _create_window(self):
+        # WPARAM / LPARAM are pointer-sized
+        WNDPROC = ctypes.WINFUNCTYPE(
+            ctypes.c_longlong, ctypes.c_void_p, ctypes.c_uint,
+            ctypes.c_ulonglong, ctypes.c_ulonglong,
+        )
+
+        # set explicit 64-bit argtypes for DefWindowProcW (default c_int is 32-bit)
+        _DefWndProc = ctypes.windll.user32.DefWindowProcW
+        _DefWndProc.argtypes = [ctypes.c_void_p, ctypes.c_uint,
+                                ctypes.c_ulonglong, ctypes.c_ulonglong]
+        _DefWndProc.restype = ctypes.c_longlong
+
+        def wnd_proc(hwnd, msg, wparam, lparam):
+            if msg == WM_TRAY_CALLBACK:
+                if lparam == 0x0205:  # WM_RBUTTONUP
+                    self._show_context_menu()
+                    return 0
+            elif msg == WM_USER_TRAY_UPDATE:
+                self._update_tooltip(self._status)
+                return 0
+            elif msg == 0x0002:  # WM_DESTROY
+                ctypes.windll.user32.PostQuitMessage(0)
+                return 0
+            return _DefWndProc(hwnd, msg, wparam, lparam)
+
+        self._wnd_proc_cb = WNDPROC(wnd_proc)
+
+        wcx = _WNDCLASSEXW()
+        wcx.cbSize = ctypes.sizeof(_WNDCLASSEXW)
+        wcx.lpfnWndProc = ctypes.cast(self._wnd_proc_cb, ctypes.c_void_p)
+        wcx.hInstance = self._hinst
+        wcx.lpszClassName = "AutoLoginTrayClass"
+
+        ctypes.windll.user32.RegisterClassExW(ctypes.byref(wcx))
+        self._hwnd = ctypes.windll.user32.CreateWindowExW(
+            0, "AutoLoginTrayClass", None, 0,
+            0, 0, 0, 0, None, None, self._hinst, None,
+        )
+        if not self._hwnd:
+            raise RuntimeError("CreateWindowExW failed")
+
+    # ── tray icon ─────────────────────────────────────────────────────────
+
+    def _create_tray_icon(self):
+        nid = _NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+        nid.hwnd = self._hwnd
+        nid.uID = TRAY_ICON_ID
+        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+        nid.uCallbackMessage = WM_TRAY_CALLBACK
+        nid.hIcon = ctypes.windll.user32.LoadIconW(0, ctypes.c_void_p(IDI_INFORMATION))
+        nid.szTip = self._title
+
+        if not ctypes.windll.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
+            raise RuntimeError("Shell_NotifyIcon NIM_ADD failed")
+
+        nid.uVersion = NOTIFYICON_VERSION_4
+        ctypes.windll.shell32.Shell_NotifyIconW(NIM_SETVERSION, ctypes.byref(nid))
+
+    def _update_tooltip(self, text):
+        nid = _NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+        nid.hwnd = self._hwnd
+        nid.uID = TRAY_ICON_ID
+        nid.uFlags = NIF_TIP
+        nid.szTip = text[:127]
+        ctypes.windll.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+
+    def _remove_tray_icon(self):
+        nid = _NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(_NOTIFYICONDATAW)
+        nid.hwnd = self._hwnd
+        nid.uID = TRAY_ICON_ID
+        ctypes.windll.shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+
+    # ── context menu ──────────────────────────────────────────────────────
+
+    def _show_context_menu(self):
+        console_visible = ctypes.windll.kernel32.GetConsoleWindow() and \
+                          ctypes.windll.user32.IsWindowVisible(
+                              ctypes.windll.kernel32.GetConsoleWindow())
+
+        menu = ctypes.windll.user32.CreatePopupMenu()
+        ctypes.windll.user32.AppendMenuW(menu, MF_GRAYED, CMD_STATUS_SHOW,
+                                         f"Status: {self._status[:60]}")
+        ctypes.windll.user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        if console_visible:
+            ctypes.windll.user32.AppendMenuW(menu, MF_STRING, CMD_TOGGLE_CONSOLE,
+                                             "Hide to Tray")
+        else:
+            ctypes.windll.user32.AppendMenuW(menu, MF_STRING, CMD_TOGGLE_CONSOLE,
+                                             "Show Console")
+        ctypes.windll.user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        ctypes.windll.user32.AppendMenuW(menu, MF_STRING, CMD_EXIT, "Exit")
+
+        pt = _POINT()
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+        ctypes.windll.user32.SetForegroundWindow(self._hwnd)
+
+        cmd = ctypes.windll.user32.TrackPopupMenu(
+            menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            pt.x, pt.y, 0, self._hwnd, None,
+        )
+        ctypes.windll.user32.PostMessageW(self._hwnd, WM_USER, 0, 0)
+        ctypes.windll.user32.DestroyMenu(menu)
+
+        if cmd == CMD_EXIT:
+            self._request_exit()
+        elif cmd == CMD_TOGGLE_CONSOLE:
+            if console_visible:
+                self._hide_console()
+            else:
+                self._show_console()
+
+    # ── message loop ──────────────────────────────────────────────────────
+
+    def _message_loop(self):
+        msg = _MSG()
+        lp_msg = ctypes.byref(msg)
+        while ctypes.windll.user32.GetMessageW(lp_msg, None, 0, 0) > 0:
+            ctypes.windll.user32.TranslateMessage(lp_msg)
+            ctypes.windll.user32.DispatchMessageW(lp_msg)
+
+    # ── lifecycle ─────────────────────────────────────────────────────────
+
+    def _detection_worker(self):
+        try:
+            run_detection_loop(
+                self._config,
+                stop_event=self._stop_event,
+                status_callback=self._on_status,
+            )
+        except Exception as e:
+            log(f"Tray worker crashed: {e}", "ERROR")
+
+    def _on_status(self, status_line):
+        """Called from worker thread. Post message to main thread for tooltip update."""
+        self._status = status_line
+        if self._hwnd:
+            ctypes.windll.user32.PostMessageW(self._hwnd, WM_USER_TRAY_UPDATE, 0, 0)
+
+    def _request_exit(self):
+        self._stop_event.set()
+        if self._hwnd:
+            ctypes.windll.user32.DestroyWindow(self._hwnd)
+
+    def _cleanup(self):
+        self._stop_event.set()
+        if self._worker and self._worker.is_alive():
+            self._worker.join(timeout=5)
+        if self._hwnd:
+            self._remove_tray_icon()
+
+
+# ── End of TrayApp ───────────────────────────────────────────────────────────
+
+
+def run_detection_loop(config, stop_event=None, status_callback=None):
+    """Core detection loop — runs until stopped or duration exceeded.
+    Args:
+        stop_event: threading.Event — when set, loop exits gracefully
+        status_callback: callable(str) — called with status line for tray tooltip
+    """
     check_url = config["check_url"]
     interval_ok = config["check_interval_ok"]
     interval_fail = config["check_interval_fail"]
     fail_threshold = config["fail_threshold"]
     timeout = config["request_timeout"]
     run_duration = config.get("run_duration_minutes", 0)
+    is_tray = status_callback is not None
 
-    log("Service started" + (" [interactive]" if INTERACTIVE else " [background]"), "START")
+    log("Service started" + (" [tray]" if is_tray else " [interactive]" if INTERACTIVE else " [background]"), "START")
     log(f"Config: auth={config.get('auth_method','http')} check={check_url} interval={interval_ok}s threshold={fail_threshold} duration={run_duration}min", "INFO")
 
     start_time = datetime.now()
@@ -548,7 +961,7 @@ def run_detection_loop(config):
     last_auth_time = None
     was_down = False
 
-    while True:
+    while not (stop_event and stop_event.is_set()):
         try:
             if end_time and datetime.now() > end_time:
                 log("Run duration reached, exiting", "STOP")
@@ -591,30 +1004,40 @@ def run_detection_loop(config):
                 else:
                     log(f"Check #{fail_count} failed: {detail}", "WARN")
 
+            # build status line for tray tooltip / interactive console
+            uptime = format_duration((datetime.now() - start_time).total_seconds())
+            sleep = interval_fail if was_down else interval_ok
+
+            if was_down and outage_start:
+                state = f"[DOWN] outage {format_duration((datetime.now() - outage_start).total_seconds())} | auth #{auth_attempts + 1}"
+            elif fail_count > 0:
+                state = f"[WARN] check failed {fail_count}/{fail_threshold}"
+            else:
+                state = "[OK]  reachable"
+
+            status_line = f"{state} | next in {sleep}s | uptime {uptime} | checks #{total_checks}"
+
+            if status_callback:
+                status_callback(status_line)
             if INTERACTIVE:
-                uptime = format_duration((datetime.now() - start_time).total_seconds())
-                sleep = interval_fail if was_down else interval_ok
+                log(status_line, "STATUS")
 
-                if was_down and outage_start:
-                    state = f"[DOWN] outage {format_duration((datetime.now() - outage_start).total_seconds())} | auth #{auth_attempts + 1}"
-                elif fail_count > 0:
-                    state = f"[WARN] check failed {fail_count}/{fail_threshold}"
-                else:
-                    state = "[OK]  reachable"
-
-                log(
-                    f"{state} | next in {sleep}s | uptime {uptime} | checks #{total_checks}",
-                    "STATUS",
-                )
-
-            time.sleep(interval_fail if was_down else interval_ok)
+            # interruptible sleep — check stop_event every 0.5s
+            _sleep = interval_fail if was_down else interval_ok
+            for _ in range(int(_sleep * 2)):
+                if stop_event and stop_event.is_set():
+                    break
+                time.sleep(0.5)
 
         except KeyboardInterrupt:
             log("Service stopped by user", "STOP")
             break
         except Exception as e:
             log(f"Unexpected error: {e}", "ERROR")
-            time.sleep(interval_fail)
+            for _ in range(int(interval_fail * 2)):
+                if stop_event and stop_event.is_set():
+                    break
+                time.sleep(0.5)
 
 
 def _need_setup(config):
@@ -630,8 +1053,19 @@ def main():
         description=f"Campus Network Auto-Login {VERSION} — 校园网自动认证工具",
     )
     parser.add_argument("--auth", action="store_true", help="Test auth once and exit")
+    parser.add_argument("--tray", action="store_true", help="System tray mode (background) — hidden window + notification area icon")
     parser.add_argument("--version", action="version", version=f"auto_login {VERSION}")
     args = parser.parse_args()
+
+    # --tray: start tray in current process (no subprocess — tray icon created first)
+    if args.tray:
+        clean_old_logs()
+        config = load_config()
+        if _need_setup(config):
+            log("Config incomplete — running setup first...", "WARN")
+            config = interactive_setup(config)
+        TrayApp(config, start_hidden=True).run()
+        return
 
     print(DISCLAIMER, flush=True)
     print()
@@ -677,13 +1111,15 @@ def main():
         if choice == "1":
             print()
             print("  ╔════════════════════════════════════════════╗")
-            print("  ║  提示：本窗口关闭后自动认证即停止。       ║")
-            print("  ║  如需长期后台静默运行（不开窗口），       ║")
-            print("  ║  请返回菜单选 [4] 无感部署指南。          ║")
+            print("  ║  自动认证已启动                           ║")
+            print("  ║  通知区域已出现托盘图标，右键可：         ║")
+            print("  ║  · Hide to Tray — 隐藏终端到托盘          ║")
+            print("  ║  · Exit — 完全退出                        ║")
+            print("  ║  隐藏后可通过右键图标 → Show Console 恢复 ║")
             print("  ╚════════════════════════════════════════════╝")
             print()
             _input("  按 Enter 开始...")
-            run_detection_loop(config)
+            TrayApp(config, start_hidden=False).run()
 
         elif choice == "2":
             if _need_setup(config):
@@ -701,6 +1137,19 @@ def main():
             show_seamless_guide(config)
 
         elif choice == "5":
+            print()
+            print("  ╔════════════════════════════════════════════╗")
+            print("  ║  后台常驻模式                             ║")
+            print("  ║  终端窗口即将消失，通知区域出现蓝色 i 图标║")
+            print("  ║  断网时自动重连，无需任何操作。           ║")
+            print("  ║  右键图标 → Show Console 可恢复终端       ║")
+            print("  ║  资源占用极低，不影响电脑性能。           ║")
+            print("  ╚════════════════════════════════════════════╝")
+            print()
+            _input("  按 Enter 开始...")
+            TrayApp(config, start_hidden=True).run()
+
+        elif choice == "6":
             print()
             print("=" * 62)
             print("  使用帮助")
@@ -729,7 +1178,9 @@ def main():
             print("     [ERROR] 行的具体原因。")
             print()
             print("  Q: 我想让它在后台一直跑，怎么办？")
-            print("  A: 选 [4] 无感部署指南，按步骤操作。")
+            print("  A: 两种方式：")
+            print("     [5] 系统托盘模式 — 隐藏窗口，右下角图标常驻。")
+            print("     [4] 无感部署指南 — 设计划任务，每天定时启动。")
             print()
             print("  Q: 为什么我双击 exe 闪退？")
             print("  A: 新版不会闪退。如果遇到闪退，右键→在终端中打开。")
@@ -751,8 +1202,9 @@ def main():
 
 
 if __name__ == "__main__":
+    _tray_mode = "--tray" in sys.argv
     try:
         main()
     finally:
-        if INTERACTIVE:
+        if INTERACTIVE and not _tray_mode:
             input("\nPress Enter to exit...")

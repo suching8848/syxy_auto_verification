@@ -3,22 +3,16 @@ $ErrorActionPreference = "Stop"
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $taskName = "CampusNetAutoLogin"
 
-# Check for auto_login.exe first (no Python needed, runs fully hidden via VBS)
+# Check for auto_login.exe first (no Python needed, runs hidden via Start-Process)
 $exePath = Join-Path $scriptDir "auto_login.exe"
-$vbsPath = Join-Path $scriptDir "run_hidden.vbs"
 
 if (Test-Path $exePath) {
-    # Create VBS launcher if not present
-    if (-not (Test-Path $vbsPath)) {
-        'CreateObject("Wscript.Shell").Run "auto_login.exe", 0, False' | Out-File -FilePath $vbsPath -Encoding ASCII
-    }
-
     $action = New-ScheduledTaskAction `
-        -Execute "wscript.exe" `
+        -Execute "powershell.exe" `
         -WorkingDirectory $scriptDir `
-        -Argument "`"$vbsPath`""
+        -Argument "-NoProfile -WindowStyle Hidden -Command Start-Process -FilePath '$exePath' -WindowStyle Hidden"
 
-    Write-Host "Using: auto_login.exe (no console, fully hidden)" -ForegroundColor Green
+    Write-Host "Using: auto_login.exe (via PowerShell Start-Process, fully hidden)" -ForegroundColor Green
 }
 else {
     # Fallback: find pythonw.exe (no console window) or python.exe
@@ -71,7 +65,7 @@ if ($existing) {
 }
 
 # Trigger: daily at 17:55
-$trigger = New-ScheduledTaskTrigger -Daily -At "17:55"
+$trigger = New-ScheduledTaskTrigger -Daily -At "19:45"
 
 # Principal: run as current user
 $principal = New-ScheduledTaskPrincipal `
@@ -101,6 +95,6 @@ Register-ScheduledTask `
     -Force | Out-Null
 
 Write-Host "Task '$taskName' registered successfully!" -ForegroundColor Green
-Write-Host "  Schedule: Daily at 17:55"
+Write-Host "  Schedule: Daily at 19:45"
 Write-Host "  Window:   Fully hidden (no popup)"
 Write-Host "  Log file: $scriptDir\logs\"

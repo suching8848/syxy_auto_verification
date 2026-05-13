@@ -1,15 +1,34 @@
 {
-    "check_url": "http://www.baidu.com",
-    "check_interval_ok": 1,
-    "check_interval_fail": 5,
-    "fail_threshold": 2,
-    "request_timeout": 5,
+    "_说明": "将此文件重命名为 auto_login_config.json 即可使用。JSON 不支持注释，所有 _xxx 开头的字段仅用于说明，可删除。",
+
+    "_认证方式": "portal_post: POST 用户名密码登录（默认）| http: GET 续期 | browser: 打开浏览器",
     "auth_method": "portal_post",
-    "run_duration_minutes": 10,
-    "auth_cooldown_seconds": 30,
+
+    "_网络检测": "↓↓↓ 以下为网络检测相关配置 ↓↓↓",
+    "check_url": "http://www.baidu.com",
     "check_expected_body": "baidu",
+    "check_interval_ok": 5,
+    "check_interval_fail": 2,
+    "_check_interval_ok说明": "网络正常时的检测间隔（秒），默认 5 秒",
+    "_check_interval_fail说明": "网络异常时的检测间隔（秒），默认 2 秒",
+    "fail_threshold": 2,
+    "_fail_threshold说明": "连续失败 N 次后触发认证，默认 2 次",
+    "request_timeout": 5,
+    "_request_timeout说明": "HTTP 请求超时（秒），默认 5 秒",
+
+    "_认证参数": "↓↓↓ portal_post 模式必填 ↓↓↓",
     "portal_url": "http://10.10.200.102",
+    "_portal_url说明": "校园网认证服务器地址，三亚学院默认已填",
     "username": "你的学号",
+    "_username说明": "校园网用户名 / 学号",
     "password": "你的密码",
-    "schedule_time": "17:55"
+    "_password说明": "校园网密码",
+
+    "_运行控制": "↓↓↓ 以下为运行参数 ↓↓↓",
+    "run_duration_minutes": 10,
+    "_run_duration_minutes说明": "运行多久自动退出（分钟），0 为无限运行",
+    "auth_cooldown_seconds": 30,
+    "_auth_cooldown_seconds说明": "两次认证最小间隔（秒），防止频繁认证",
+    "schedule_time": "17:55",
+    "_schedule_time说明": "计划任务触发时间（24 小时制），用于菜单 [4] 定时部署"
 }

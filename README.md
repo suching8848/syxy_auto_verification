@@ -1,13 +1,13 @@
 # Campus Network Auto-Login
 
-> **当前版本：v1.3** | 免费开源 | 仅供学习研究使用
+> **当前版本：v1.4** | 免费开源 | 仅供学习研究使用
 
 校园网断线自动认证工具。定时检测网络状态，检测到 captive portal 后通过后台 HTTP 请求静默完成认证，**完全无感**——不断网、不弹窗、不影响使用。
 
 ## 工作原理
 
 ```
-启动 → 每秒检测网络状态（GET baidu.com + 校验响应内容）
+启动 → 定时检测网络状态（GET baidu.com + 校验响应内容）
   ├── 响应含"baidu" → 网络正常 → 等待后继续检测
   └── 响应不含"baidu" → portal 劫持 → 连续 2 次确认 →
       提取 JS 跳转参数 → GET index.jsp 拿 Cookie → POST 学号密码 → 认证完成
@@ -23,6 +23,17 @@
 | `http` | portal 只需访问特定 URL 续期 | 后台 GET 请求 portal URL |
 | `browser` | portal 必须交互才能登录 | 打开浏览器 + 模拟 Enter |
 
+## 四种运行模式
+
+| # | 模式 | 入口 | 说明 |
+|---|------|------|------|
+| 1 | **交互终端** | `python auto_login.py` → 菜单 [1] | 持续检测 + 断网自动重连，终端可见 |
+| 2 | **认证测试** | `--auth` 或菜单 [2] | 单次认证验证（已在线时可能不可靠 — portal logout API 不稳定） |
+| 3 | **无感部署** | 菜单 [4] → `setup_task.ps1` | 每天定时触发，通过 Windows 计划任务后台静默运行 |
+| 4 | **系统托盘** | `--tray` 或菜单 [5] | 隐藏终端窗口，通知区域显示图标；鼠标悬停查看状态，右键退出 |
+
+> **模式 2 说明**：`--auth` 在已登录状态下会先尝试调 portal 登出 API 再重认证。但部分 portal 的登出 API 不可靠（返回成功但实际未下线），此时可能报 FAILED。**最准确的测试方式是在断网时运行。**
+
 ## 文件说明
 
 ```
@@ -30,7 +41,6 @@ auto_login.py               # 主程序
 auto_login_config.json      # 配置文件（含密码，不提交 git）
 auto_login_config.example.json  # 配置模板（可提交）
 setup_task.ps1              # 一键部署到 Windows 计划任务
-run_hidden.vbs              # 无窗口启动器（计划任务用）
 logs/                       # 运行日志（按日期，自动清理 7 天前）
 ```
 
@@ -40,7 +50,7 @@ logs/                       # 运行日志（按日期，自动清理 7 天前�
 
 **方式 A：下载 exe（推荐，无需安装 Python）**
 
-从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.3.zip`，解压到任意文件夹。
+从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.4.zip`，解压到任意文件夹。
 
 **方式 B：运行 Python 脚本**
 
@@ -58,8 +68,8 @@ cd syxy_auto_verification
 ```json
 {
     "check_url": "http://www.baidu.com",
-    "check_interval_ok": 1,
-    "check_interval_fail": 5,
+    "check_interval_ok": 5,
+    "check_interval_fail": 2,
     "fail_threshold": 2,
     "request_timeout": 5,
     "auth_method": "portal_post",
@@ -112,7 +122,7 @@ Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameter
 $trigger = New-ScheduledTaskTrigger -Daily -At "你的时间"
 ```
 
-exe 用户通过 `run_hidden.vbs` 启动，计划任务**完全无窗口**。
+exe 用户通过 `powershell.exe Start-Process -WindowStyle Hidden` 启动，计划任务**完全无窗口**。
 
 ### 5. 取消计划任务
 
@@ -126,7 +136,7 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 
 ```
 ══════════════════════════════════════════════════════
-  校园网自动认证工具 v1.3
+  校园网自动认证工具 v1.4
   项目: https://github.com/suching8848/syxy_auto_verification
 ──────────────────────────────────────────────────────
   程序目录: C:\Users\xxx\Desktop\校园网认证
@@ -135,14 +145,16 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
   [2] 测试认证      — 发一次请求验证配置是否正确
   [3] 修改配置      — 学号 / 密码 / 认证地址
   [4] 无感部署指南  — 关弹窗 + 计划任务（实现完全无感）
-  [5] 使用帮助      — 完整说明和常见问题
+  [5] 系统托盘模式  — 隐藏窗口 + 通知区域图标，后台运行
+  [6] 使用帮助      — 完整说明和常见问题
   [q] 退出
 ──────────────────────────────────────────────────────
 ```
 
-- **[1] 启动自动认证**：开始循环检测，窗口关闭即停止。每 1 秒检测一次，发现断网 5 秒内完成认证
+- **[1] 启动自动认证**：开始循环检测，窗口关闭即停止。每 5 秒检测一次，发现断网 2 秒内确认
 - **[4] 无感部署指南**：手把手教你怎么关弹窗、设计划任务，菜单直接显示可复制的目录路径
-- **[5] 使用帮助**：FAQ，涵盖配置文件、认证失败、闪退等常见问题
+- **[5] 系统托盘模式**：隐藏终端窗口，通知区域显示蓝色信息图标。鼠标悬停查看运行状态，右键菜单 Exit 退出。或直接 `python auto_login.py --tray`
+- **[6] 使用帮助**：FAQ，涵盖配置文件、认证失败、闪退等常见问题
 
 ## 全部配置项
 
@@ -151,8 +163,8 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 | `auth_method` | `"portal_post"` | 认证模式：`"portal_post"` / `"http"` / `"browser"` |
 | `check_url` | `http://www.baidu.com` | 检测网络用的地址（HTTP，HTTPS 无法被 portal 劫持） |
 | `check_expected_body` | `"baidu"` | 响应内容必须包含的关键词，否则判定为 portal 劫持 |
-| `check_interval_ok` | `1` | 网络正常时检测间隔（秒） |
-| `check_interval_fail` | `5` | 断网/portal 模式下检测间隔（秒） |
+| `check_interval_ok` | `5` | 网络正常时检测间隔（秒） |
+| `check_interval_fail` | `2` | 断网/portal 模式下检测间隔（秒） |
 | `fail_threshold` | `2` | 连续失败多少次后触发认证 |
 | `request_timeout` | `5` | HTTP 请求超时（秒） |
 | `run_duration_minutes` | `10` | 运行多久自动退出，`0` 为无限 |
@@ -178,7 +190,7 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 
 ### portal_post（默认，推荐）
 
-适用于需要提交用户名密码的校园网 portal（如三亚学院深澜系统）。
+适用于需要提交用户名密码的校园网 portal（如三亚学院系统）。
 
 1. GET `check_url` → portal 返回含 JS 跳转的页面（`location.href='index.jsp?...'`）
 2. 正则提取 index.jsp 完整 URL（含 `wlanuserip`、`nasip`、`mac` 等连接参数）
@@ -223,7 +235,7 @@ python auto_login.py --auth
 
 ### 后台运行（计划任务）
 
-通过计划任务 + `run_hidden.vbs` 启动，无任何窗口。只记录关键事件（DOWN/AUTH/RECOVER/STOP），不输出 STATUS 行。日志在 `logs/` 目录。
+通过计划任务 + PowerShell `Start-Process -WindowStyle Hidden` 启动，无任何窗口。只记录关键事件（DOWN/AUTH/RECOVER/STOP），不输出 STATUS 行。日志在 `logs/` 目录。
 
 ## 分发给别人
 
@@ -234,14 +246,12 @@ pip install pyinstaller
 pyinstaller --onefile --console --name auto_login auto_login.py
 ```
 
-分发给别人需要的文件（已打包在 `auto_login_v1.3.zip`）：
+分发给别人需要的文件（已打包在 `auto_login_v1.4.zip`）：
 
 ```
 auto_login.exe              # 主程序
 auto_login_config.example.json  # 配置模板
 setup_task.ps1              # 计划任务部署脚本
-run_hidden.vbs              # 无窗口启动器
-```
 
 对方解压后双击 exe 即可，配置向导会引导完成设置。
 
@@ -262,12 +272,22 @@ Start-Process chrome -ArgumentList "--auto-open-devtools-for-tabs", "http://www.
 
 ## 版本历史
 
+### v1.4 (2026-05-14)
+
+- 新增**系统托盘模式**（`--tray` / 菜单 [5]）：隐藏窗口，通知区域图标常驻
+- `--auth` 新增 logout 回退：已在线时先调 portal 登出 API，再触发 captive portal 重定向拿真实参数
+- `run_detection_loop` 支持 `stop_event` 和 `status_callback`，线程安全退出
+- 优化认证流程：index.jsp 响应体解析、portal API 参数探测、本地 IP 回退
+- 菜单新增 [5] 系统托盘模式，[6] 使用帮助（原 [5]）
+- 整理文档为四种运行模式
+- 计划任务无窗口启动改为 PowerShell `Start-Process -WindowStyle Hidden`（移除 `run_hidden.vbs`）
+
 ### v1.3 (2026-05-13)
 
 - 默认 `auth_method` 改为 `portal_post`，默认三亚学院认证地址
 - `portal_host` 统一为 `portal_url`，消除两个字段的混淆
-- 新增 `run_hidden.vbs` 无窗口启动器，计划任务真正零弹窗
-- `setup_task.ps1` 自动检测 exe，优先用 VBS 模式 + `Hidden=$true`
+- 新增计划任务无窗口启动（最初用 VBS，v1.4 改为 PowerShell Start-Process -WindowStyle Hidden）
+- `setup_task.ps1` 自动检测 exe，通过 PowerShell `Start-Process -WindowStyle Hidden` 实现零窗口
 - 菜单显示程序目录路径，无感部署指南可一键复制
 - portal_post 模式检查返回 JSON 中的 `result:fail`，避免误报
 - http 模式增加响应内容 fail/error 检测
