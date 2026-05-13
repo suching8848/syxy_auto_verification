@@ -50,7 +50,7 @@ DEFAULT_CONFIG = {
     "fail_threshold": 2,
     "request_timeout": 5,
     "auth_method": "portal_post",
-    "run_duration_minutes": 10,
+    "run_duration_minutes": 60,
     "browser_wait_seconds": 3,
     "auth_cooldown_seconds": 30,
     "check_expected_body": "baidu",

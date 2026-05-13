@@ -25,7 +25,7 @@
     "_password说明": "校园网密码",
 
     "_运行控制": "↓↓↓ 以下为运行参数 ↓↓↓",
-    "run_duration_minutes": 10,
+    "run_duration_minutes": 60,
     "_run_duration_minutes说明": "运行多久自动退出（分钟），0 为无限运行",
     "auth_cooldown_seconds": 30,
     "_auth_cooldown_seconds说明": "两次认证最小间隔（秒），防止频繁认证",

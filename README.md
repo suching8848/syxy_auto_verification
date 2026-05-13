@@ -73,7 +73,7 @@ cd syxy_auto_verification
     "fail_threshold": 2,
     "request_timeout": 5,
     "auth_method": "portal_post",
-    "run_duration_minutes": 10,
+    "run_duration_minutes": 60,
     "auth_cooldown_seconds": 30,
     "check_expected_body": "baidu",
     "portal_url": "http://10.10.200.102",
@@ -116,7 +116,7 @@ Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameter
 .\setup_task.ps1
 ```
 
-每天 17:55 自动启动，运行 10 分钟后自动退出。修改时间编辑 `setup_task.ps1` 第 85 行：
+每天 17:55 自动启动，运行 60 分钟后自动退出。修改时间编辑 `setup_task.ps1` 第 85 行：
 
 ```powershell
 $trigger = New-ScheduledTaskTrigger -Daily -At "你的时间"
@@ -167,7 +167,7 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 | `check_interval_fail` | `2` | 断网/portal 模式下检测间隔（秒） |
 | `fail_threshold` | `2` | 连续失败多少次后触发认证 |
 | `request_timeout` | `5` | HTTP 请求超时（秒） |
-| `run_duration_minutes` | `10` | 运行多久自动退出，`0` 为无限 |
+| `run_duration_minutes` | `60` | 运行多久自动退出（分钟），`0` 为无限 |
 | `auth_cooldown_seconds` | `30` | 两次认证的最小间隔，防止频繁认证 |
 
 **portal_post 模式字段：**

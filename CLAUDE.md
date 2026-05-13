@@ -102,7 +102,7 @@ Signature: `run_detection_loop(config, stop_event=None, status_callback=None)`
 2. On failure, retry at `check_interval_fail` interval; after `fail_threshold` consecutive failures, trigger auth
 3. On success, wait `check_interval_ok` seconds before next check
 4. Auth cooldown (`auth_cooldown_seconds`, default 30s) prevents repeated auth attempts
-5. Runs until `run_duration_minutes` (default 10, `0` = infinite) elapses, `stop_event` is set, or Ctrl+C
+5. Runs until `run_duration_minutes` (default 60, `0` = infinite) elapses, `stop_event` is set, or Ctrl+C
 
 ### Logging
 
