@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Campus network auto-login tool (v1.4). Detects captive portal via HTTP content inspection and re-authenticates in the background. Runs as a Windows scheduled task or as a system tray app with notification area icon.
+Campus network auto-login tool (v1.5). Detects captive portal via HTTP content inspection and re-authenticates in the background. Runs as a Windows scheduled task or as a system tray app with notification area icon.
 
 ## Commands
 
@@ -17,6 +17,9 @@ python auto_login.py
 
 # System tray mode (hidden window + notification area icon, no terminal)
 python auto_login.py --tray
+
+# Background mode (no console, detection loop only — used by scheduled task)
+pythonw.exe auto_login.py --background
 
 # Print version
 python auto_login.py --version
@@ -37,10 +40,11 @@ No build, lint, or test steps. Python 3 standard library only, no pip dependenci
 
 Single-file script (`auto_login.py`) with JSON config (`auto_login_config.json`).
 
-**Three run modes, auto-detected:**
-- `INTERACTIVE = sys.stdout.isatty()` — when run from a terminal, shows interactive menu (options 1-6, q), then runs detection loop inside a `TrayApp` (with visible console). Menu options: [1] Launch with tray, [2] Test auth, [3] Edit config, [4] Scheduled task guide, [5] Background tray (hidden), [6] FAQ, [q] Quit.
+**Four run modes:**
+- `INTERACTIVE` (try/except on `sys.stdout.isatty()`, defaults False if stdout is None) — when run from a terminal, shows interactive menu (options 1-6, q), then runs detection loop inside a `TrayApp` (with visible console). Menu options: [1] Launch with tray, [2] Test auth, [3] Edit config, [4] Scheduled task guide, [5] Background tray (hidden), [6] FAQ, [q] Quit.
+- `--background` — forces background mode regardless of `isatty()`, calls `run_detection_loop` directly. Used by `setup_task.ps1`.
 - `--tray` — starts `TrayApp` with `start_hidden=True` directly, no menu. Notification area icon only.
-- Background mode — when run via scheduled task (`pythonw.exe`), skips menu and tray entirely, calls `run_detection_loop` directly. Only logs events (START/DOWN/AUTH/RECOVER/STOP), no per-cycle output.
+- Auto-detected background — when `not INTERACTIVE` (pythonw.exe has no stdout), skips menu and tray, calls `run_detection_loop` directly. Logs key events (START/DOWN/AUTH/RECOVER/STOP) + STATUS every 2 checks (≈10s).
 
 **`--auth` flag** bypasses all paths — does a single auth attempt and exits. If already online, tries portal logout APIs first to trigger captive portal redirect and get real auth parameters. Triggers config wizard if config is incomplete.
 

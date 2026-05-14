@@ -50,7 +50,7 @@ logs/                       # 运行日志（按日期，自动清理 7 天前�
 
 **方式 A：下载 exe（推荐，无需安装 Python）**
 
-从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.4.zip`，解压到任意文件夹。
+从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.5.zip`，解压到任意文件夹。
 
 **方式 B：运行 Python 脚本**
 
@@ -130,13 +130,13 @@ cd "你的程序目录"    # 例如 cd "C:\Users\xxx\Desktop\校园网认证"
 
 脚本做了以下事情：
 - **自动选择运行方式**：优先使用 exe（通过 `powershell.exe Start-Process -WindowStyle Hidden` 启动），没有 exe 则用 Python（优先 `pythonw.exe` 无窗口）
-- **注册计划任务**：任务名 `CampusNetAutoLogin`，每天 9:15 触发，运行 60 分钟后自动退出
+- **注册计划任务**：任务名 `CampusNetAutoLogin`，每天 19:50 触发，运行 60 分钟后自动退出
 - **任务配置**：`LogonType Interactive`（支持 browser 模式模拟按键）、`Hidden=$true`（不弹窗口）、2 小时执行时限、已有实例运行时忽略新实例
 
 修改触发时间编辑 `setup_task.ps1` 第 67-68 行：
 
 ```powershell
-$trigger = New-ScheduledTaskTrigger -Daily -At "9:15"   # 改成你的时间
+$trigger = New-ScheduledTaskTrigger -Daily -At "19:50"   # 改成你的时间
 ```
 
 修改运行时长编辑 `auto_login_config.json`：
@@ -159,7 +159,7 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 
 ```
 ══════════════════════════════════════════════════════
-  校园网自动认证工具 v1.4
+  校园网自动认证工具 v1.5
   项目: https://github.com/suching8848/syxy_auto_verification
 ──────────────────────────────────────────────────────
   程序目录: C:\Users\xxx\Desktop\校园网认证
@@ -258,7 +258,7 @@ python auto_login.py --auth
 
 ### 后台运行（计划任务）
 
-通过计划任务 + PowerShell `Start-Process -WindowStyle Hidden` 启动，无任何窗口。只记录关键事件（DOWN/AUTH/RECOVER/STOP），不输出 STATUS 行。日志在 `logs/` 目录。
+计划任务直接运行 `pythonw.exe`（无窗口） + `--background` 标志，完全静默。除关键事件（DOWN/AUTH/RECOVER/STOP）外，每 2 轮检测（约 10 秒）输出 STATUS 状态行，方便通过 `logs/` 目录日志文件监控运行状态。
 
 ## 分发给别人
 
@@ -269,7 +269,7 @@ pip install pyinstaller
 pyinstaller --onefile --console --name auto_login auto_login.py
 ```
 
-分发给别人需要的文件（已打包在 `auto_login_v1.4.zip`）：
+分发给别人需要的文件（已打包在 `auto_login_v1.5.zip`）：
 
 ```
 auto_login.exe              # 主程序

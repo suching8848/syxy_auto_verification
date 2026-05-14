@@ -58,7 +58,7 @@ DEFAULT_CONFIG = {
     "username": "",
     "password": "",
     # scheduled task trigger time (24h format)
-    "schedule_time": "17:55",
+    "schedule_time": "19:50",
 }
 
 # True when user runs `python auto_login.py` directly (has a console)

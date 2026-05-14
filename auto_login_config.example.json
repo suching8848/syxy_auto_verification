@@ -29,6 +29,6 @@
     "_run_duration_minutes说明": "运行多久自动退出（分钟），0 为无限运行",
     "auth_cooldown_seconds": 30,
     "_auth_cooldown_seconds说明": "两次认证最小间隔（秒），防止频繁认证",
-    "schedule_time": "17:55",
-    "_schedule_time说明": "计划任务触发时间（24 小时制），用于菜单 [4] 定时部署"
+    "schedule_time": "19:50",
+    "_schedule_time说明": "计划任务触发时间（24 小时制），修改 setup_task.ps1 第 67-68 行"
 }

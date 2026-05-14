@@ -65,7 +65,7 @@ if ($existing) {
 }
 
 # Trigger: daily at specified time (24h format)
-$trigger = New-ScheduledTaskTrigger -Daily -At "9:15"
+$trigger = New-ScheduledTaskTrigger -Daily -At "19:50"
 
 # Principal: run as current user
 $principal = New-ScheduledTaskPrincipal `
@@ -95,6 +95,6 @@ Register-ScheduledTask `
     -Force | Out-Null
 
 Write-Host "Task '$taskName' registered successfully!" -ForegroundColor Green
-Write-Host "  Schedule: Daily at 9:15"
+Write-Host "  Schedule: Daily at 19:50"
 Write-Host "  Window:   Fully hidden (no popup)"
 Write-Host "  Log file: $scriptDir\logs\"
