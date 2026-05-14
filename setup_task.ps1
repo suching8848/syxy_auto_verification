@@ -15,7 +15,7 @@ if (Test-Path $exePath) {
     Write-Host "Using: auto_login.exe (via PowerShell Start-Process, fully hidden)" -ForegroundColor Green
 }
 else {
-    # Fallback: find pythonw.exe (no console window) or python.exe
+    # Find pythonw.exe (no console window) or python.exe as fallback
     $pythonPath = $null
     foreach ($name in @("pythonw.exe", "python.exe")) {
         $found = Get-Command $name -ErrorAction SilentlyContinue
@@ -49,12 +49,12 @@ else {
         }
     }
 
-    Write-Host "Using Python: $pythonPath" -ForegroundColor Green
+    Write-Host "Using Python: $pythonPath (--background)" -ForegroundColor Green
 
     $action = New-ScheduledTaskAction `
         -Execute $pythonPath `
         -WorkingDirectory $scriptDir `
-        -Argument "auto_login.py"
+        -Argument "$scriptDir\auto_login.py --background"
 }
 
 # Remove existing task if present
@@ -64,8 +64,8 @@ if ($existing) {
     Write-Host "Removed existing task '$taskName'" -ForegroundColor Yellow
 }
 
-# Trigger: daily at 17:55
-$trigger = New-ScheduledTaskTrigger -Daily -At "19:45"
+# Trigger: daily at specified time (24h format)
+$trigger = New-ScheduledTaskTrigger -Daily -At "9:15"
 
 # Principal: run as current user
 $principal = New-ScheduledTaskPrincipal `
@@ -95,6 +95,6 @@ Register-ScheduledTask `
     -Force | Out-Null
 
 Write-Host "Task '$taskName' registered successfully!" -ForegroundColor Green
-Write-Host "  Schedule: Daily at 19:45"
+Write-Host "  Schedule: Daily at 9:15"
 Write-Host "  Window:   Fully hidden (no popup)"
 Write-Host "  Log file: $scriptDir\logs\"

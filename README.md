@@ -1,6 +1,6 @@
 # Campus Network Auto-Login
 
-> **当前版本：v1.4** | 免费开源 | 仅供学习研究使用
+> **当前版本：v1.5** | 免费开源 | 仅供学习研究使用
 
 校园网断线自动认证工具。定时检测网络状态，检测到 captive portal 后通过后台 HTTP 请求静默完成认证，**完全无感**——不断网、不弹窗、不影响使用。
 
@@ -110,19 +110,42 @@ Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameter
 
 **② 部署计划任务**
 
-以管理员身份打开 PowerShell，进入程序所在目录，运行：
+**打开管理员 PowerShell**（三种方式任选一种）：
+
+- 右键开始菜单 → **终端(管理员)** 或 **Windows PowerShell(管理员)**
+- `Win + R` → 输入 `powershell` → `Ctrl + Shift + Enter`（以管理员运行）
+- 在程序目录空白处 `Shift + 右键` → **在此处打开 PowerShell 窗口**，然后执行 `Start-Process powershell -Verb RunAs` 提升到管理员
+
+**进入程序所在目录**（如果不是从目录打开的）：
+
+```powershell
+cd "你的程序目录"    # 例如 cd "C:\Users\xxx\Desktop\校园网认证"
+```
+
+然后运行部署脚本：
 
 ```powershell
 .\setup_task.ps1
 ```
 
-每天 17:55 自动启动，运行 60 分钟后自动退出。修改时间编辑 `setup_task.ps1` 第 85 行：
+脚本做了以下事情：
+- **自动选择运行方式**：优先使用 exe（通过 `powershell.exe Start-Process -WindowStyle Hidden` 启动），没有 exe 则用 Python（优先 `pythonw.exe` 无窗口）
+- **注册计划任务**：任务名 `CampusNetAutoLogin`，每天 9:15 触发，运行 60 分钟后自动退出
+- **任务配置**：`LogonType Interactive`（支持 browser 模式模拟按键）、`Hidden=$true`（不弹窗口）、2 小时执行时限、已有实例运行时忽略新实例
+
+修改触发时间编辑 `setup_task.ps1` 第 67-68 行：
 
 ```powershell
-$trigger = New-ScheduledTaskTrigger -Daily -At "你的时间"
+$trigger = New-ScheduledTaskTrigger -Daily -At "9:15"   # 改成你的时间
 ```
 
-exe 用户通过 `powershell.exe Start-Process -WindowStyle Hidden` 启动，计划任务**完全无窗口**。
+修改运行时长编辑 `auto_login_config.json`：
+
+```json
+"run_duration_minutes": 60   // 0 = 无限运行
+```
+
+> **注意**：如果以 exe 方式运行，计划任务**完全无窗口**，不会弹出任何终端或浏览器。
 
 ### 5. 取消计划任务
 
@@ -177,7 +200,7 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 | `portal_url` | 校园网认证服务器地址（默认三亚学院 `http://10.10.200.102`） |
 | `username` | 校园网用户名 / 学号 |
 | `password` | 校园网密码 |
-| `schedule_time` | 计划任务触发时间（24h 制，默认 `17:55`） |
+| `schedule_time` | 计划任务触发时间（24h 制，修改 `setup_task.ps1` 第 68 行） |
 
 **http / browser 模式字段：**
 
@@ -271,6 +294,14 @@ Start-Process chrome -ArgumentList "--auto-open-devtools-for-tabs", "http://www.
 5. 如果字段名或路径与默认的不同，需要修改脚本 `do_auth_portal_post()` 中的 form_data
 
 ## 版本历史
+
+### v1.5 (2026-05-14)
+
+- 新增 `--background` 参数：计划任务传此标志，不依赖 `isatty()` 判断运行模式，彻底解决 pythonw.exe 无 stdout 崩溃问题
+- 修复 `sys.stdout.isatty()` 在计划任务环境下 `sys.stdout` 为 None 导致模块级崩溃的 bug
+- 后台模式新增定期 STATUS 日志：每 2 轮检测（约 10 秒）输出完整状态行，方便通过日志文件监控运行状态
+- `setup_task.ps1`：Python 路径统一传完整路径 + `--background`，优先 pythonw.exe（无窗口），任务 `Hidden=$true` 实现完全静默
+- 交互模式与后台模式分离：背景模式跳过所有 `print()`，避免无 stdout 崩溃；交互模式启动后才输出 DISCLAIMER 和菜单
 
 ### v1.4 (2026-05-14)
 

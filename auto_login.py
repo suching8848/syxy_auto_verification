@@ -19,7 +19,7 @@ if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "v1.4"
+VERSION = "v1.5"
 
 # Required on Windows 11 for tray icon to appear — set before any window creation
 try:
@@ -62,7 +62,11 @@ DEFAULT_CONFIG = {
 }
 
 # True when user runs `python auto_login.py` directly (has a console)
-INTERACTIVE = sys.stdout.isatty()
+# sys.stdout can be None under Task Scheduler with pythonw.exe
+try:
+    INTERACTIVE = sys.stdout.isatty()
+except Exception:
+    INTERACTIVE = False
 
 
 def get_log_path():
@@ -1021,6 +1025,8 @@ def run_detection_loop(config, stop_event=None, status_callback=None):
                 status_callback(status_line)
             if INTERACTIVE:
                 log(status_line, "STATUS")
+            elif total_checks % 2 == 0:
+                log(status_line, "STATUS")
 
             # interruptible sleep — check stop_event every 0.5s
             _sleep = interval_fail if was_down else interval_ok
@@ -1054,6 +1060,7 @@ def main():
     )
     parser.add_argument("--auth", action="store_true", help="Test auth once and exit")
     parser.add_argument("--tray", action="store_true", help="System tray mode (background) — hidden window + notification area icon")
+    parser.add_argument("--background", action="store_true", help="Background mode — no console output, detection loop only")
     parser.add_argument("--version", action="version", version=f"auto_login {VERSION}")
     args = parser.parse_args()
 
@@ -1065,6 +1072,14 @@ def main():
             log("Config incomplete — running setup first...", "WARN")
             config = interactive_setup(config)
         TrayApp(config, start_hidden=True).run()
+        return
+
+    # Background mode (scheduled task or --background flag)
+    # Must come before print() — pythonw.exe has no stdout
+    if not INTERACTIVE or args.background:
+        clean_old_logs()
+        config = load_config()
+        run_detection_loop(config)
         return
 
     print(DISCLAIMER, flush=True)
@@ -1085,11 +1100,6 @@ def main():
             log(f"Auth test mode: method={method}", "START")
         ok = do_auth(config, None)
         log(f"Auth test {'PASSED' if ok else 'FAILED'}", "STOP")
-        return
-
-    # Background mode (scheduled task): run detection loop directly, no menu
-    if not INTERACTIVE:
-        run_detection_loop(config)
         return
 
     # Interactive mode with no flags: show menu
