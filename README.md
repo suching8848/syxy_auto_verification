@@ -23,7 +23,7 @@
 | `http` | portal 只需访问特定 URL 续期 | 后台 GET 请求 portal URL |
 | `browser` | portal 必须交互才能登录 | 打开浏览器 + 模拟 Enter |
 
-## 四种运行模式
+## 五种运行模式
 
 | # | 模式 | 入口 | 说明 |
 |---|------|------|------|
@@ -31,6 +31,7 @@
 | 2 | **认证测试** | `--auth` 或菜单 [2] | 单次认证验证（已在线时可能不可靠 — portal logout API 不稳定） |
 | 3 | **无感部署** | 菜单 [4] → `setup_task.ps1` | 每天定时触发，通过 Windows 计划任务后台静默运行 |
 | 4 | **系统托盘** | `--tray` 或菜单 [5] | 隐藏终端窗口，通知区域显示图标；鼠标悬停查看状态，右键退出 |
+| 5 | **开机自启** | `setup_task.ps1 -Boot` | 系统启动时自动运行，持续监控网络，断网即重连。Session 0 运行，无需用户登录 |
 
 > **模式 2 说明**：`--auth` 在已登录状态下会先尝试调 portal 登出 API 再重认证。但部分 portal 的登出 API 不可靠（返回成功但实际未下线），此时可能报 FAILED。**最准确的测试方式是在断网时运行。**
 
@@ -133,7 +134,7 @@ cd "你的程序目录"    # 例如 cd "C:\Users\xxx\Desktop\校园网认证"
 - **注册计划任务**：任务名 `CampusNetAutoLogin`，每天 19:45 触发，运行 60 分钟后自动退出
 - **任务配置**：`LogonType Interactive`（支持 browser 模式模拟按键）、`Hidden=$true`（不弹窗口）、2 小时执行时限、已有实例运行时忽略新实例
 
-修改触发时间编辑 `setup_task.ps1` 第 67-68 行：
+修改触发时间编辑 `setup_task.ps1` 中的 `$trigger` 行：
 
 ```powershell
 $trigger = New-ScheduledTaskTrigger -Daily -At "19:45"   # 改成你的时间
@@ -147,7 +148,54 @@ $trigger = New-ScheduledTaskTrigger -Daily -At "19:45"   # 改成你的时间
 
 > **注意**：如果以 exe 方式运行，计划任务**完全无窗口**，不会弹出任何终端或浏览器。
 
-### 5. 取消计划任务
+### 5. 开机自启动
+
+除了每天定时触发，你还可以让脚本在 Windows 开机时自动启动，持续监控网络，断网即自动重连。
+
+**① 部署开机自启任务**
+
+以管理员身份打开 PowerShell，进入程序目录，运行：
+
+```powershell
+.\setup_task.ps1 -Boot
+```
+
+脚本会创建 `CampusNetAutoLogin_Boot` 计划任务（与 `CampusNetAutoLogin` 独立）：
+
+| 配置项 | 值 |
+|---|---|
+| 触发条件 | 系统启动时 |
+| 运行身份 | SYSTEM (Session 0) |
+| 运行时长 | 无限（`run_duration_minutes` 强制为 0）|
+| 崩溃恢复 | 最多重试 3 次，间隔 1 分钟 |
+| 窗口 | 完全隐藏 |
+
+**② 验证**
+
+不重启也能手动启动测试：
+
+```powershell
+Start-ScheduledTask -TaskName CampusNetAutoLogin_Boot
+```
+
+查看 `logs/` 目录确认脚本正常运行。
+
+**③ 认证模式兼容性**
+
+| 模式 | 开机自启兼容？| 说明 |
+|---|---|---|
+| portal_post | 兼容 | 纯 HTTP，Session 0 正常工作 |
+| http | 兼容 | 纯 HTTP，Session 0 正常工作 |
+| browser | 不兼容 | 需要用户会话打开浏览器，请改用 portal_post 或 http |
+
+**④ 注意事项**
+
+- 建议将程序放在系统可访问的位置（如 `C:\Program Files\校园网认证\`）
+- 开机自启任务和每日定时任务是独立的，建议二选一
+- 如需停止：`Stop-ScheduledTask -TaskName CampusNetAutoLogin_Boot`
+- 如需删除：`Unregister-ScheduledTask -TaskName CampusNetAutoLogin_Boot -Confirm:$false`
+
+### 6. 取消计划任务
 
 ```powershell
 Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false

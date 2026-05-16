@@ -21,17 +21,26 @@ python auto_login.py --tray
 # Background mode (no console, detection loop only — used by scheduled task)
 pythonw.exe auto_login.py --background
 
+# Boot auto-start mode (continuous monitoring, run_duration forced to 0, Session 0)
+python auto_login.py --boot
+
 # Print version
 python auto_login.py --version
 
 # Build standalone exe (no Python required to run)
 pyinstaller --onefile --console --name auto_login auto_login.py
 
-# Deploy as scheduled task (PowerShell, as Administrator)
+# Deploy as daily scheduled task (PowerShell, as Administrator)
 .\setup_task.ps1
 
-# Remove scheduled task
+# Deploy as boot auto-start task (PowerShell, as Administrator)
+.\setup_task.ps1 -Boot
+
+# Remove daily scheduled task
 Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
+
+# Remove boot auto-start task
+Unregister-ScheduledTask -TaskName CampusNetAutoLogin_Boot -Confirm:$false
 ```
 
 No build, lint, or test steps. Python 3 standard library only, no pip dependencies (except `pyinstaller` for exe packaging).
@@ -40,10 +49,11 @@ No build, lint, or test steps. Python 3 standard library only, no pip dependenci
 
 Single-file script (`auto_login.py`) with JSON config (`auto_login_config.json`).
 
-**Four run modes:**
+**Five run modes:**
 - `INTERACTIVE` (try/except on `sys.stdout.isatty()`, defaults False if stdout is None) — when run from a terminal, shows interactive menu (options 1-6, q), then runs detection loop inside a `TrayApp` (with visible console). Menu options: [1] Launch with tray, [2] Test auth, [3] Edit config, [4] Scheduled task guide, [5] Background tray (hidden), [6] FAQ, [q] Quit.
 - `--background` — forces background mode regardless of `isatty()`, calls `run_detection_loop` directly. Used by `setup_task.ps1`.
 - `--tray` — starts `TrayApp` with `start_hidden=True` directly, no menu. Notification area icon only.
+- `--boot` — overrides `run_duration_minutes` to 0, logs Session 0 warnings, calls `run_detection_loop` directly. Used by `setup_task.ps1 -Boot`.
 - Auto-detected background — when `not INTERACTIVE` (pythonw.exe has no stdout), skips menu and tray, calls `run_detection_loop` directly. Logs key events (START/DOWN/AUTH/RECOVER/STOP) + STATUS every 2 checks (≈10s).
 
 **`--auth` flag** bypasses all paths — does a single auth attempt and exits. If already online, tries portal logout APIs first to trigger captive portal redirect and get real auth parameters. Triggers config wizard if config is incomplete.
@@ -118,10 +128,14 @@ Dual output — always prints to stdout/stderr; also appends to `logs/auto_login
 
 ### `setup_task.ps1`
 
-- Prefers `auto_login.exe` if present → launches via `powershell.exe Start-Process -WindowStyle Hidden` (fully hidden)
+- **Daily mode** (no flags): creates `CampusNetAutoLogin` task with `-Daily -At "19:45"` trigger
+- **Boot mode** (`-Boot`): creates `CampusNetAutoLogin_Boot` task with `-AtStartup` trigger
+- Prefers `auto_login.exe` if present → launches via `powershell.exe Start-Process -WindowStyle Hidden` (fully hidden); boot mode appends `--boot` argument
 - Falls back to `pythonw.exe` (no console window), then `python.exe`; searches PATH first, then common Python install locations
-- Creates task with `LogonType Interactive` (required for browser mode + `keybd_event`), `RunLevel Limited`
-- `Hidden=$true` on task settings, 2-hour execution time limit, ignores new instances if already running
+- Daily task: `LogonType Interactive` (required for browser mode + `keybd_event`), `RunLevel Limited`, 2-hour execution time limit, `RestartCount 0`
+- Boot task: `LogonType S4U` with `UserId SYSTEM` (Session 0, no user logon required), `ExecutionTimeLimit 0` (unlimited), `RestartCount 3` with 1-minute interval
+- `Hidden=$true` on task settings, ignores new instances if already running
+- Uses `param([switch]$Boot)` to toggle between daily and boot mode
 
 ## Key dependencies in stdlib
 
@@ -131,5 +145,5 @@ Dual output — always prints to stdout/stderr; also appends to `logs/auto_login
 - `ctypes` + `ctypes.windll.*` — Win32 API: Shell_NotifyIcon, CreateWindowExW, RegisterClassExW, keybd_event, GetConsoleWindow, ShowWindow, EnumWindows, SetCurrentProcessExplicitAppUserModelID
 - `threading` — `Thread` + `Event` for tray worker thread and clean shutdown
 - `socket` — get local IP as fallback for queryString construction
-- `argparse` — CLI flags (`--auth`, `--tray`, `--version`)
+- `argparse` — CLI flags (`--auth`, `--tray`, `--background`, `--boot`, `--version`)
 - `sys.frozen` (PyInstaller) — distinguishes exe vs script for path resolution and exit behavior

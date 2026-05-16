@@ -1,16 +1,19 @@
+param([switch]$Boot)
+
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$taskName = "CampusNetAutoLogin"
+$taskName = if ($Boot) { "CampusNetAutoLogin_Boot" } else { "CampusNetAutoLogin" }
 
 # Check for auto_login.exe first (no Python needed, runs hidden via Start-Process)
 $exePath = Join-Path $scriptDir "auto_login.exe"
 
 if (Test-Path $exePath) {
+    $exeArgs = if ($Boot) { " -ArgumentList '--boot'" } else { "" }
     $action = New-ScheduledTaskAction `
         -Execute "powershell.exe" `
         -WorkingDirectory $scriptDir `
-        -Argument "-NoProfile -WindowStyle Hidden -Command Start-Process -FilePath '$exePath' -WindowStyle Hidden"
+        -Argument "-NoProfile -WindowStyle Hidden -Command Start-Process -FilePath '$exePath' -WindowStyle Hidden$exeArgs"
 
     Write-Host "Using: auto_login.exe (via PowerShell Start-Process, fully hidden)" -ForegroundColor Green
 }
@@ -51,10 +54,11 @@ else {
 
     Write-Host "Using Python: $pythonPath (--background)" -ForegroundColor Green
 
+    $pyArgs = if ($Boot) { " --boot" } else { "" }
     $action = New-ScheduledTaskAction `
         -Execute $pythonPath `
         -WorkingDirectory $scriptDir `
-        -Argument "$scriptDir\auto_login.py --background"
+        -Argument "$scriptDir\auto_login.py --background$pyArgs"
 }
 
 # Remove existing task if present
@@ -64,23 +68,48 @@ if ($existing) {
     Write-Host "Removed existing task '$taskName'" -ForegroundColor Yellow
 }
 
-# Trigger: daily at specified time (24h format)
-$trigger = New-ScheduledTaskTrigger -Daily -At "19:45"
+# Trigger
+if ($Boot) {
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+}
+else {
+    $trigger = New-ScheduledTaskTrigger -Daily -At "19:45"
+}
 
-# Principal: run as current user
-$principal = New-ScheduledTaskPrincipal `
-    -UserId $env:USERNAME `
-    -LogonType Interactive `
-    -RunLevel Limited
+# Principal
+if ($Boot) {
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId "SYSTEM" `
+        -LogonType S4U `
+        -RunLevel Limited
+}
+else {
+    $principal = New-ScheduledTaskPrincipal `
+        -UserId $env:USERNAME `
+        -LogonType Interactive `
+        -RunLevel Limited
+}
 
 # Settings
-$settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -StartWhenAvailable `
-    -MultipleInstances IgnoreNew `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
-    -RestartCount 0
+if ($Boot) {
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit 0 `
+        -RestartCount 3 `
+        -RestartInterval (New-TimeSpan -Minutes 1)
+}
+else {
+    $settings = New-ScheduledTaskSettingsSet `
+        -AllowStartIfOnBatteries `
+        -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable `
+        -MultipleInstances IgnoreNew `
+        -ExecutionTimeLimit (New-TimeSpan -Hours 2) `
+        -RestartCount 0
+}
 
 # Hidden: don't show any window
 $settings.Hidden = $true
@@ -95,6 +124,13 @@ Register-ScheduledTask `
     -Force | Out-Null
 
 Write-Host "Task '$taskName' registered successfully!" -ForegroundColor Green
-Write-Host "  Schedule: Daily at 19:45"
-Write-Host "  Window:   Fully hidden (no popup)"
-Write-Host "  Log file: $scriptDir\logs\"
+if ($Boot) {
+    Write-Host "  Schedule:   At system startup (continuous monitoring)"
+    Write-Host "  Principal:  SYSTEM (Session 0, no user logon required)"
+    Write-Host "  Auth modes: portal_post / http only (browser NOT compatible with Session 0)"
+}
+else {
+    Write-Host "  Schedule: Daily at 19:45"
+    Write-Host "  Window:   Fully hidden (no popup)"
+}
+Write-Host "  Log file:  $scriptDir\logs\"

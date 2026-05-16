@@ -598,6 +598,10 @@ def show_seamless_guide(config):
     print("    把时间改成你想要的（24 小时制，如 17:58），")
     print("    保存后重新运行 .\\setup_task.ps1 即可。")
     print()
+    print("  ▸ 替代方案：开机自启动（不需要每天同一时间触发）：")
+    print("    以管理员身份运行: .\\setup_task.ps1 -Boot")
+    print("    系统启动时自动开始监控，全天候断网即重连。")
+    print()
     print("  ┌──────────────────────────────────────────────────┐")
     print("  │ 第四步：验证是否生效                             │")
     print("  └──────────────────────────────────────────────────┘")
@@ -1061,6 +1065,7 @@ def main():
     parser.add_argument("--auth", action="store_true", help="Test auth once and exit")
     parser.add_argument("--tray", action="store_true", help="System tray mode (background) — hidden window + notification area icon")
     parser.add_argument("--background", action="store_true", help="Background mode — no console output, detection loop only")
+    parser.add_argument("--boot", action="store_true", help="Boot auto-start mode — continuous monitoring (run_duration_minutes=0), Session 0 safe")
     parser.add_argument("--version", action="version", version=f"auto_login {VERSION}")
     args = parser.parse_args()
 
@@ -1072,6 +1077,17 @@ def main():
             log("Config incomplete — running setup first...", "WARN")
             config = interactive_setup(config)
         TrayApp(config, start_hidden=True).run()
+        return
+
+    # Boot auto-start mode (开机自启动, Session 0 via scheduled task)
+    if args.boot:
+        clean_old_logs()
+        config = load_config()
+        config["run_duration_minutes"] = 0
+        log("Boot mode: continuous monitoring (run_duration=0)", "START")
+        if config.get("auth_method") == "browser":
+            log("WARNING: browser auth requires user session — boot mode runs in Session 0, it will fail. Use portal_post or http.", "WARN")
+        run_detection_loop(config)
         return
 
     # Background mode (scheduled task or --background flag)
