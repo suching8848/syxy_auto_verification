@@ -51,7 +51,7 @@ logs/                       # 运行日志（按日期，自动清理 7 天前�
 
 **方式 A：下载 exe（推荐，无需安装 Python）**
 
-从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.5.zip`，解压到任意文件夹。
+从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.6.zip`，解压到任意文件夹。
 
 **方式 B：运行 Python 脚本**
 
@@ -317,7 +317,7 @@ pip install pyinstaller
 pyinstaller --onefile --console --name auto_login auto_login.py
 ```
 
-分发给别人需要的文件（已打包在 `auto_login_v1.5.zip`）：
+分发给别人需要的文件（已打包在 `auto_login_v1.6.zip`）：
 
 ```
 auto_login.exe              # 主程序
