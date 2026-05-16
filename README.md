@@ -1,6 +1,6 @@
 # Campus Network Auto-Login
 
-> **当前版本：v1.5** | 免费开源 | 仅供学习研究使用
+> **当前版本：v1.6** | 免费开源 | 仅供学习研究使用
 
 校园网断线自动认证工具。定时检测网络状态，检测到 captive portal 后通过后台 HTTP 请求静默完成认证，**完全无感**——不断网、不弹窗、不影响使用。
 
@@ -342,6 +342,15 @@ Start-Process chrome -ArgumentList "--auto-open-devtools-for-tabs", "http://www.
 5. 如果字段名或路径与默认的不同，需要修改脚本 `do_auth_portal_post()` 中的 form_data
 
 ## 版本历史
+
+### v1.6 (2026-05-16)
+
+- 新增**开机自启动**模式：`setup_task.ps1 -Boot` 注册 `CampusNetAutoLogin_Boot` 计划任务
+- 新增 `--boot` CLI 标志：强制无限运行 (`run_duration=0`)，Session 0 browser 模式兼容性警告
+- 开机自启任务使用 `AtStartup` 触发器 + `SYSTEM/S4U` 身份，系统启动即运行，无需用户登录
+- 崩溃自动重启：最多重试 3 次，间隔 1 分钟
+- `show_seamless_guide()` 增加开机自启替代方案提示
+- 文档：四种→五种运行模式，README 新增开机自启章节
 
 ### v1.5 (2026-05-14)
 
