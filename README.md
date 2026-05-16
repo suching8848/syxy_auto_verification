@@ -130,13 +130,13 @@ cd "你的程序目录"    # 例如 cd "C:\Users\xxx\Desktop\校园网认证"
 
 脚本做了以下事情：
 - **自动选择运行方式**：优先使用 exe（通过 `powershell.exe Start-Process -WindowStyle Hidden` 启动），没有 exe 则用 Python（优先 `pythonw.exe` 无窗口）
-- **注册计划任务**：任务名 `CampusNetAutoLogin`，每天 19:50 触发，运行 60 分钟后自动退出
+- **注册计划任务**：任务名 `CampusNetAutoLogin`，每天 19:45 触发，运行 60 分钟后自动退出
 - **任务配置**：`LogonType Interactive`（支持 browser 模式模拟按键）、`Hidden=$true`（不弹窗口）、2 小时执行时限、已有实例运行时忽略新实例
 
 修改触发时间编辑 `setup_task.ps1` 第 67-68 行：
 
 ```powershell
-$trigger = New-ScheduledTaskTrigger -Daily -At "19:50"   # 改成你的时间
+$trigger = New-ScheduledTaskTrigger -Daily -At "19:45"   # 改成你的时间
 ```
 
 修改运行时长编辑 `auto_login_config.json`：
