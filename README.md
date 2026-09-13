@@ -130,7 +130,7 @@ cd syxy_auto_verification
 
 ### 2. 配置
 
-**exe 用户**：双击 `auto_login.exe`，程序会自动检测配置缺失并弹出配置向导，按提示输入学号和密码即可。
+**exe 用户**：双击 `CampusNet.exe`。第一次运行会在它旁边自动生成 `auto_login_config.json` 和 `logs\`，然后在界面「设置」页填好学号和密码、点保存即可。
 
 **Python 用户**：将 `auto_login_config.example.json` 重命名为 `auto_login_config.json`，用记事本打开编辑：
 
@@ -269,9 +269,18 @@ Start-ScheduledTask -TaskName CampusNetAutoLogin_Boot
 Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 ```
 
-## exe 菜单说明
+## 终端菜单说明（v1.7.0 起不再随包发布）
 
-双击 `auto_login.exe` 后显示交互菜单：
+> **`auto_login.exe`（终端版）从 v1.7.0 起不再打包发布**，普通用户请用上面的 `CampusNet.exe`。
+> 下面这个菜单仍然存在，但只在你从源码运行时才看得到：
+>
+> ```bash
+> python auto_login.py
+> ```
+>
+> 需要终端版 exe 的话，可以用 `build/auto_login.spec` 自己构建，或用旧版 Release（≤ v1.6.1）。
+
+从源码运行时显示交互菜单：
 
 ```
 ══════════════════════════════════════════════════════
