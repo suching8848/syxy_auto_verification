@@ -1,0 +1,14 @@
+# 换行策略：这个仓库是 Windows 专用的，但源文件必须保持 LF 入库，
+# 否则 core.autocrlf=true 会在检出时把 LF 换成 CRLF，改写文件内容 ——
+# 对 setup_task.ps1 尤其危险：它有 UTF-8 BOM，任何内容改写都可能把 BOM 弄丢，
+# 而丢 BOM 会让 Windows PowerShell 5.1 按 GBK 解码并拒绝解析整个脚本。
+* text=auto eol=lf
+
+# 批处理必须 CRLF（cmd.exe 对 LF 的兼容性不可靠）
+*.bat text eol=crlf
+
+# 二进制资源：不要做任何换行转换
+*.ico binary
+*.png binary
+*.exe binary
+*.zip binary

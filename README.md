@@ -1,8 +1,64 @@
 # Campus Network Auto-Login
 
-> **当前版本：v1.6.1** | 免费开源 | 仅供学习研究使用
+> **当前版本：v1.7.0** | 免费开源 | 仅供学习研究使用
 
 校园网断线自动认证工具。定时检测网络状态，检测到 captive portal 后通过后台 HTTP 请求静默完成认证，**完全无感**——不断网、不弹窗、不影响使用。
+
+## 两种典型用法
+
+这个工具解决的是同一件事——**一直盯着网络，断了立刻自动重连**——只是有两种启动方式，按你的需要挑：
+
+### 场景 A：临时用一次，想看着它干活
+
+打开 `CampusNet.exe`，切到 **「手动守护」** 页，点 **「开始守护」**，然后就一直挂着：
+
+- 页面顶部大字号显示当前状态（待命中 / 守护中 / 正在重连），配彩色圆点，一眼就知道通不通
+- 断网瞬间自动重连，日志区用人话写清楚："检测到断网，开始自动重连…" → "自动重连成功，网络已恢复（断网时长 1m2s）"
+- 点右上角 **✕** 会**缩到右下角托盘**继续守护，不会退出；托盘右键可"打开主窗口"或"退出"
+- 想让它停，点 **「停止守护」**（或托盘右键退出）
+
+> 场景 A 需要窗口，所以要用 `CampusNet.exe`（图形版）。
+> 如果你更喜欢终端，`python auto_login.py` 的菜单模式是同一套逻辑。
+
+### 场景 B：装一次，之后永远不用管
+
+每天固定时刻校园网会要求重新认证，你把这个时刻填一次就行——**大多数人用这个**：
+
+1. 打开 `CampusNet.exe`，切到 **「每天自动守护」** 页
+2. 填好「每天 23:00 启动，守护 30 分钟后自动停止」
+3. 点 **「开启每天自动守护」**，在弹出的 UAC 窗口点「是」
+
+之后每天到点系统会自己拉起它，**全程无窗口、无托盘图标、不弹任何东西**——你甚至不知道它在跑。它持续探测网络，断网那一刻立即自动重连，跑满时长后自己退出，当天只在 `logs\` 里留一份日志。
+
+同一页还有「测试一次静默运行」（跑 1 分钟，你亲眼确认它真的什么都不显示）和「取消每天自动守护」。
+
+命令行等价写法：
+
+```powershell
+.\setup_task.ps1 -Silent -SilentAt 22:50 -RunMinutes 30
+Unregister-ScheduledTask -TaskName CampusNetAutoLogin_Silent -Confirm:$false
+```
+
+> **为什么能做到"完全无提示"？** 因为 `CampusNet.exe` 是以无控制台子系统（`--windowed`）打包的，进程从出生就没有任何窗口可显示；而旧的 `auto_login.exe` 是 `--console` 版本，被计划任务拉起时 Windows 一定会先弹一个黑框再靠代码藏起来——那一瞬间是看得见的。这是两个 exe 的**本质区别**，静默场景必须用 `CampusNet.exe`。
+
+### 界面长什么样
+
+窗口分三个选项卡，**「每天自动守护」是默认页**，因为大部分人只用这个：
+
+| 选项卡 | 内容 |
+|---|---|
+| 手动守护 | 状态圆点 + 开始/停止守护 + 运行日志（默认展开） |
+| 每天自动守护 | 每天几点启动、守护多少分钟、「开启每天自动守护」按钮 |
+| 设置 | 学号、密码、校园网认证地址、检测地址、默认打开哪个选项卡 |
+
+配置和日志都在程序旁边自动生成：第一次运行 `CampusNet.exe` 会在同目录创建 `auto_login_config.json` 和 `logs\`，不需要手动准备任何文件。
+
+### 两种 exe 怎么选
+
+| 文件 | 界面 | 用途 |
+|---|---|---|
+| `CampusNet.exe` | 图形窗口 + 托盘 | 手动使用（场景 A）、静默守护（场景 B） |
+| `auto_login.exe` | 终端 | 排障、`--auth` 单次测试、老部署方式 |
 
 ## 工作原理
 
@@ -23,26 +79,35 @@
 | `http` | portal 只需访问特定 URL 续期 | 后台 GET 请求 portal URL |
 | `browser` | portal 必须交互才能登录 | 打开浏览器 + 模拟 Enter |
 
-## 五种运行模式
+## 运行模式
 
 | # | 模式 | 入口 | 说明 |
 |---|------|------|------|
-| 1 | **交互终端** | `python auto_login.py` → 菜单 [1] | 持续检测 + 断网自动重连，终端可见 |
-| 2 | **认证测试** | `--auth` 或菜单 [2] | 单次认证并验证联网，退出码 0 成功、1 失败 |
-| 3 | **无感部署** | 菜单 [4] → `setup_task.ps1` | 每天定时触发，通过 Windows 计划任务后台静默运行 |
-| 4 | **系统托盘** | `--tray` 或菜单 [5] | 隐藏终端窗口，通知区域显示图标；鼠标悬停查看状态，右键退出 |
-| 5 | **开机自启** | `setup_task.ps1 -Boot` | 系统启动时自动运行，持续监控网络，断网即重连。Session 0 运行，无需用户登录 |
+| 1 | **图形界面** | 双击 `CampusNet.exe` | 窗口 + 托盘，点「开始守护」后持续守护、断网自动重连（场景 A） |
+| 2 | **静默守护** | `CampusNet.exe --silent` 或 `setup_task.ps1 -Silent` | 无窗口无托盘，到点自己探测、断网即重连、跑满时长自退（场景 B） |
+| 3 | **交互终端** | `python auto_login.py` → 菜单 [1] | 持续检测 + 断网自动重连，终端可见 |
+| 4 | **认证测试** | `--auth` 或菜单 [2] | 单次认证并验证联网，退出码 0 成功、1 失败 |
+| 5 | **无感部署** | 菜单 [4] → `setup_task.ps1` | 每天定时触发，通过 Windows 计划任务后台静默运行 |
+| 6 | **系统托盘** | `--tray` 或菜单 [5] | 隐藏终端窗口，通知区域显示图标；鼠标悬停查看状态，右键退出 |
+| 7 | **开机自启** | `setup_task.ps1 -Boot` | 系统启动时自动运行，持续监控网络，断网即重连。Session 0 运行，无需用户登录 |
+
+> **模式 2 说明**：静默守护由计划任务到点拉起，不再需要点任何按钮。`--silent --now` 可跳过等待、立刻开始探测（手动测试用）。
+
 
 > **模式 2 说明**：认证测试和自动重连都不会主动登出。`portal_post` 必须收到明确的成功 JSON，并通过后续联网检测才算成功；已在线时可能缺少认证参数，建议在自然断网时测试。
 
 ## 文件说明
 
 ```
-auto_login.py               # 主程序
+auto_login.py               # 主程序 / 引擎（CLI + 检测 + 认证）
+gui_app.py                  # 图形界面入口（窗口 + 托盘，场景 A/B）
 auto_login_config.json      # 配置文件（含密码，不提交 git）
 auto_login_config.example.json  # 配置模板（可提交）
-setup_task.ps1              # 一键部署到 Windows 计划任务
+setup_task.ps1              # 一键部署到 Windows 计划任务（含 -Silent 静默模式）
 test_auto_login.py          # 离线回归测试（python -m unittest test_auto_login）
+build/CampusNet.spec        # 图形版打包配方（--windowed，无控制台）
+build/auto_login.spec       # 终端版打包配方（--console）
+assets/campusnet.ico        # 程序图标
 logs/                       # 运行日志（按日期，自动清理 7 天前）
 RELEASE_v*.md               # 各版本 Release 说明稿
 LICENSE                     # MIT 协议
@@ -54,7 +119,7 @@ LICENSE                     # MIT 协议
 
 **方式 A：下载 exe（推荐，无需安装 Python）**
 
-从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.6.1.zip`，解压到任意文件夹。
+从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.7.0.zip`，解压到任意文件夹（**注意整个文件夹一起解压，`assets` 子目录是图标，不能少**）。
 
 **方式 B：运行 Python 脚本**
 
@@ -313,23 +378,33 @@ python auto_login.py --auth
 
 ## 分发给别人
 
-打包成单个 exe，对方不需要装 Python：
+打包成两个 exe，对方不需要装 Python：
 
 ```powershell
 pip install pyinstaller
+
+# 图形版（推荐给普通用户）：--windowed 无控制台，双击出窗口，也能用于静默守护
+pyinstaller --clean --noconfirm build/CampusNet.spec      # → dist\CampusNet.exe
+
+# 终端版（排障用）：--console，保留完整终端菜单
 pyinstaller --onefile --console --name auto_login --specpath build auto_login.py
 ```
 
-分发给别人需要的文件（已打包在 `auto_login_v1.6.1.zip`）：
+> **为什么必须用 spec 文件而不是一行命令？** `CampusNet.spec` 里写死了
+> `console=False` 和图标路径。官方文档见 `docs/GUI_PLAN.md`。
+
+分发给别人需要的文件（已打包在 `auto_login_v1.7.0.zip`）：
 
 ```
-auto_login.exe              # 主程序
-auto_login_config.example.json  # 配置模板
-setup_task.ps1              # 计划任务部署脚本
-RELEASE_v1.6.1.md           # 本版 Release 说明
+CampusNet.exe                   # 图形版主程序（双击即用，也支持 --silent）
+assets\campusnet.ico            # 托盘/程序图标，必须和 exe 一起
+使用说明.txt                     # 三句话说清怎么用
+setup_task.ps1                  # 计划任务部署脚本（含 -Silent 静默模式）
+auto_login_config.example.json  # 配置模板（程序也会自己生成）
+RELEASE_v1.7.0.md               # 本版 Release 说明
 ```
 
-对方解压后双击 exe 即可，配置向导会引导完成设置。
+对方解压后双击 `CampusNet.exe`：同目录会自动生成 `auto_login_config.json` 和 `logs\`，在「设置」页填好学号密码即可。
 
 > 发布新版时，Release 说明稿统一放在仓库根目录（`RELEASE_v*.md`），
 > 打包进 zip 后再上传到 GitHub Release，避免构建产物被清理后说明丢失。
@@ -350,6 +425,20 @@ Start-Process chrome -ArgumentList "--auto-open-devtools-for-tabs", "http://www.
 5. 如果字段名或路径与默认的不同，需要修改脚本 `do_auth_portal_post()` 中的 form_data
 
 ## 版本历史
+
+### v1.7.0 (2026-09-13)
+
+- **新增图形界面 `CampusNet.exe`**（`--windowed` 打包，无控制台）：三个选项卡 —— 「手动守护」「每天自动守护」「设置」，默认打开每天自动守护
+- **「每天自动守护」可在界面里一键部署**：填好时刻和时长点按钮，弹出 UAC 后自动注册每日计划任务，全程不用碰命令行
+- **日志翻译成人话**：底层 `[AUTH]/[RECOVER]/[DOWN]` 在界面上显示为「检测到断网，开始自动重连…」「自动重连成功，网络已恢复（断网时长 1m2s）」，原始记录收进「详细日志」
+- **配置与日志就近生成**：程序旁边会自动创建 `auto_login_config.json` 和 `logs\`，配置存在程序旁边、双击可手改
+- **新增 `--silent` 静默守护**：无窗口、无托盘、无任何提示，持续探测、断网即刻重连，跑满时长自退。`--silent --now --run-minutes 1` 可手动试跑
+- **修复：exe 读不到配置**（重要）：冻结后的 exe 只在自身目录找配置，找不到就静默退回默认值（无账号、5s/60min），并把日志写进 `dist\logs\`。现改为固定在 exe 旁边查找与生成
+- **修复：窗口显示后自动消失**：复用控制台版 `TrayApp` 时，其 `_hide_console()` 会用 `EnumWindows` 把进程内所有可见窗口一并隐藏，包括 Tk 主窗口
+- **修复：退出时刷屏报错**：窗口销毁后 120ms 轮询定时器仍会操作已销毁控件（`TclError`）
+- **修复：静默时刻算法**：手动启动时若当日窗口已过，会空等 24 小时，现立即开跑
+- **修复：`setup_task.ps1` 参数**：新增 `-Silent` / `-SilentAt` / `-RunMinutes`
+- 新增离线回归测试（29 个，全部 mock 网络），含静默调度算法、配置原子写、日志翻译层
 
 ### v1.6.1 (2026-09-13)
 

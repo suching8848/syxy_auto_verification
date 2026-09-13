@@ -19,7 +19,7 @@ if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "v1.6.1"
+VERSION = "v1.7.0"
 
 # Required on Windows 11 for tray icon to appear — set before any window creation
 try:
@@ -39,8 +39,49 @@ DISCLAIMER = (
 )
 
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "auto_login_config.json")
+CONFIG_FILENAME = "auto_login_config.json"
 LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
 MAX_LOG_DAYS = 7
+
+
+def exe_dir():
+    """Directory the user actually launched from: the exe's folder when frozen
+    (sys.executable), the script's folder when running from source."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def find_config_file():
+    """Locate auto_login_config.json.
+
+    The rule is simple and deliberate: the config lives beside the exe (or, when
+    running from source, in the project directory). A portable tool must be
+    self-contained — a fresh folder should get its own config, never silently
+    inherit one from %APPDATA% or from whoever's project happened to be the
+    working directory.
+
+    %APPDATA% is only a last resort for the case where the program folder is not
+    writable (installed under Program Files); see config_write_path().
+    """
+    beside = os.path.join(exe_dir(), CONFIG_FILENAME)
+    if os.path.exists(beside):
+        return beside
+    if not getattr(sys, "frozen", False) and os.path.exists(CONFIG_FILE):
+        return CONFIG_FILE
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        installed = os.path.join(appdata, "CampusNet", CONFIG_FILENAME)
+        if os.path.exists(installed):
+            return installed
+    return beside
+
+
+def get_runtime_dir():
+    """Directory to keep logs in — beside the active config, so a portable
+    folder stays self-contained and an installed copy never writes to a
+    read-only program directory."""
+    return os.path.dirname(find_config_file()) or SCRIPT_DIR
 
 DEFAULT_CONFIG = {
     "portal_url": "http://10.10.200.102",
@@ -59,6 +100,17 @@ DEFAULT_CONFIG = {
     "password": "",
     # scheduled task trigger time (24h format)
     "schedule_time": "20:30",
+    # ── GUI options ──
+    # Which usage mode the GUI shows first: "silent" (每天自动守护, the common
+    # case) or "manual" (window + tray, for temporary use). UI preference only.
+    "mode": "silent",
+    # Scenario A: closing the window hides to tray (True) or exits (False)
+    "close_to_tray": True,
+    # Scenario B: the clock time (24h "HH:MM") at which the silent watcher
+    # starts. Empty string = silent mode disabled.
+    "silent_start_time": "",
+    # how long the silent watcher keeps probing before it quits, in minutes
+    "silent_run_minutes": 30,
 }
 
 # True when user runs `python auto_login.py` directly (has a console)
@@ -68,16 +120,49 @@ try:
 except Exception:
     INTERACTIVE = False
 
+# Optional log consumer (GUI). Called with (line, level) for every log record.
+# The sink runs on whatever thread produced the record — a sink that touches
+# tkinter widgets will crash. GUI sinks must only enqueue, never draw.
+_LOG_SINK = None
+
+
+def set_log_sink(fn):
+    """Register a callable(line, level) receiving every log record. None clears it."""
+    global _LOG_SINK
+    _LOG_SINK = fn
+
+
+def get_log_sink():
+    return _LOG_SINK
+
 
 def get_log_path():
-    os.makedirs(LOG_DIR, exist_ok=True)
+    log_dir = os.path.join(get_runtime_dir(), "logs")
+    os.makedirs(log_dir, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
-    return os.path.join(LOG_DIR, f"auto_login_{today}.log")
+    return os.path.join(log_dir, f"auto_login_{today}.log")
+
+
+def ensure_config_file():
+    """Create auto_login_config.json with defaults if none exists yet.
+
+    Makes the tool self-contained: a fresh folder needs nothing but the exe, and
+    the GUI can then say "settings live in this file" truthfully. Returns the
+    path (existing or newly written), or None if it could not be created.
+    """
+    existing = find_config_file()
+    if os.path.exists(existing):
+        return existing
+    target = config_write_path()
+    if save_config(DEFAULT_CONFIG.copy(), path=target):
+        return target
+    return None
 
 
 def clean_old_logs():
     cutoff = datetime.now() - timedelta(days=MAX_LOG_DAYS)
-    for f in glob.glob(os.path.join(LOG_DIR, "auto_login_*.log")):
+    log_dir = os.path.join(get_runtime_dir(), "logs")
+    for f in glob.glob(os.path.join(log_dir, "auto_login_*.log")):
         try:
             ftime = datetime.fromtimestamp(os.path.getmtime(f))
             if ftime < cutoff:
@@ -87,9 +172,10 @@ def clean_old_logs():
 
 
 def load_config():
-    if os.path.exists(CONFIG_FILE):
+    path = find_config_file()
+    if os.path.exists(path):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             merged = DEFAULT_CONFIG.copy()
             merged.update(cfg)
@@ -97,6 +183,62 @@ def load_config():
         except (json.JSONDecodeError, IOError) as e:
             log(f"Config load failed: {e}, using defaults", "WARN")
     return DEFAULT_CONFIG.copy()
+
+
+def config_write_path():
+    """Where to persist config on first run.
+
+    Prefer the folder the user launched from, so a portable deployment stays
+    self-contained. Only fall back to %APPDATA% when that folder is not
+    writable (an installed copy under Program Files).
+    """
+    existing = find_config_file()
+    if os.path.exists(existing):
+        return existing
+    beside = os.path.join(exe_dir(), CONFIG_FILENAME)
+    try:
+        probe = beside + ".probe"
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("")
+        os.remove(probe)
+        return beside
+    except OSError:
+        pass
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        target_dir = os.path.join(appdata, "CampusNet")
+        try:
+            os.makedirs(target_dir, exist_ok=True)
+            return os.path.join(target_dir, CONFIG_FILENAME)
+        except OSError:
+            pass
+    return beside
+
+
+def save_config(config, path=None):
+    """Write config atomically so a crash mid-write cannot corrupt the file.
+
+    Writes to a sibling .tmp file first and then os.replace()s it into place,
+    which is atomic on Windows for same-volume renames.
+    """
+    path = path or CONFIG_FILE
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except (IOError, OSError, TypeError, ValueError) as e:
+        log(f"Config save failed: {e}", "ERROR")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
 
 
 def log(msg, level="INFO"):
@@ -111,6 +253,11 @@ def log(msg, level="INFO"):
             f.write(line + "\n")
     except IOError:
         pass
+    if _LOG_SINK is not None:
+        try:
+            _LOG_SINK(line, level)
+        except Exception:
+            pass  # a broken sink must never break the detection loop
 
 
 def format_duration(seconds):
@@ -648,12 +795,11 @@ def interactive_setup(config):
     print()
     print("  配置完成！正在保存...")
 
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(config, f, ensure_ascii=False, indent=4)
-        print(f"  已保存到: {CONFIG_FILE}")
-    except IOError as e:
-        print(f"  保存失败: {e}")
+    target = config_write_path()
+    if save_config(config, path=target):
+        print(f"  已保存到: {target}")
+    else:
+        print(f"  保存失败: {target}")
 
     print()
     return config
@@ -707,13 +853,16 @@ class TrayApp:
     """Hidden window + notification area icon for background operation.
     Uses ctypes to call Win32 Shell_NotifyIcon API — zero external dependencies."""
 
-    def __init__(self, config, start_hidden=False):
+    def __init__(self, config, start_hidden=False, status_text="Initializing...",
+                 on_error=None, on_done=None):
         self._config = config.copy()
         if start_hidden:
             self._config["run_duration_minutes"] = 0
         self._stop_event = threading.Event()
         self._worker = None
-        self._status = "Initializing..."
+        self._status = status_text
+        self._on_error = on_error
+        self._on_done = on_done
         self._hwnd = None
         self._hinst = ctypes.windll.kernel32.GetModuleHandleW(None)
         self._wnd_proc_cb = None
@@ -905,7 +1054,17 @@ class TrayApp:
             )
         except Exception as e:
             log(f"Tray worker crashed: {e}", "ERROR")
+            if self._on_error:
+                try:
+                    self._on_error(e)
+                except Exception:
+                    pass
         finally:
+            if self._on_done:
+                try:
+                    self._on_done()
+                except Exception:
+                    pass
             if self._hwnd:
                 ctypes.windll.user32.PostMessageW(self._hwnd, WM_USER + 2, 0, 0)
 
@@ -965,18 +1124,29 @@ def log_failure_context(url, detail):
         log(f"Detail: {detail} — remote host unreachable (genuine outage or DNS failure)", "WARN")
 
 
-def run_detection_loop(config, stop_event=None, status_callback=None):
+def run_detection_loop(config, stop_event=None, status_callback=None,
+                       duration_override=None):
     """Core detection loop — runs until stopped or duration exceeded.
+
+    Keeps probing check_url and re-authenticates as soon as the portal blocks
+    traffic. This is the behaviour both GUI scenarios reuse: scenario A calls it
+    from the window/tray, scenario B calls it with no UI at all.
+
     Args:
         stop_event: threading.Event — when set, loop exits gracefully
         status_callback: callable(str) — called with status line for tray tooltip
+        duration_override: int minutes — overrides config run_duration_minutes
+            (0 = run forever)
     """
     check_url = config["check_url"]
     interval_ok = config["check_interval_ok"]
     interval_fail = config["check_interval_fail"]
     fail_threshold = config["fail_threshold"]
     timeout = config["request_timeout"]
-    run_duration = config.get("run_duration_minutes", 0)
+    if duration_override is None:
+        run_duration = config.get("run_duration_minutes", 0)
+    else:
+        run_duration = duration_override
     is_tray = status_callback is not None
 
     log("Service started" + (" [tray]" if is_tray else " [interactive]" if INTERACTIVE else " [background]"), "START")
@@ -1095,6 +1265,153 @@ def _need_setup(config):
     return not config.get("portal_url")
 
 
+def _stdin_available():
+    """True when a usable stdin exists. Under --windowed (or pythonw.exe)
+    sys.stdin is None, so any input() call would raise and kill the process."""
+    try:
+        return sys.stdin is not None and sys.stdin.readable()
+    except Exception:
+        return False
+
+
+def notify_setup_required(config, gui=True):
+    """The config is incomplete and no terminal is available to fix it.
+    Logs an actionable message and, when a GUI is possible, pops a dialog.
+
+    Returns True when the notice reached a human, False when there was nowhere
+    to show it (silent/scheduled runs) — callers should then just abort.
+    """
+    missing = ("username/password" if config.get("auth_method") == "portal_post"
+               else "portal_url")
+    log(f"Config incomplete (missing: {missing}) and no console is available", "ERROR")
+    log("Open the program's Settings panel once to fill it in", "ERROR")
+    if not gui:
+        return False
+    try:
+        import tkinter
+        from tkinter import messagebox
+        root = tkinter.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            f"Campus Network Auto-Login {VERSION}",
+            "配置文件还没填完整，程序无法启动。\n\n"
+            f"缺少：{missing}\n\n"
+            "请双击本程序打开主窗口，展开「设置」填好后再启动。",
+        )
+        root.destroy()
+        return True
+    except Exception as e:
+        log(f"Could not show setup dialog: {e}", "WARN")
+        return False
+
+
+def _parse_hhmm(text):
+    """Parse 'HH:MM' (24h) into a datetime.time, or None when unset/invalid."""
+    if not text or not isinstance(text, str):
+        return None
+    m = re.match(r"^\s*([01]?\d|2[0-3]):([0-5]\d)\s*$", text)
+    if not m:
+        return None
+    return datetime.min.replace(hour=int(m.group(1)), minute=int(m.group(2))).time()
+
+
+def plan_silent_window(config, now=None, allow_tomorrow=True):
+    """Scenario B scheduling math, pure and testable.
+
+    The watcher is launched ahead of the expected outage and then probes
+    continuously, so all this has to decide is how long to stand by before
+    probing begins, and how long to keep probing.
+
+    Returns (start_at, end_at, wait_seconds) where wait_seconds is how long to
+    idle before probing begins (0 = start probing right now), or None when
+    silent_start_time is unset or malformed.
+
+    allow_tomorrow=False means "the user launched this by hand": if today's
+    window has already elapsed we start immediately instead of sleeping a whole
+    day, because waiting 24h is never what someone clicking the app wants.
+    """
+    now = now or datetime.now()
+    target = _parse_hhmm(config.get("silent_start_time"))
+    if target is None:
+        return None
+    try:
+        run_minutes = int(config.get("silent_run_minutes", 30))
+    except (TypeError, ValueError):
+        run_minutes = 30
+
+    start_at = datetime.combine(now.date(), target)
+    end_at = start_at + timedelta(minutes=run_minutes)
+    if end_at <= now:
+        if allow_tomorrow:
+            start_at += timedelta(days=1)
+            end_at = start_at + timedelta(minutes=run_minutes)
+        else:
+            # Launching by hand: today's window already went by, so just run now.
+            start_at = now
+            end_at = now + timedelta(minutes=run_minutes)
+    wait_seconds = max(0.0, (start_at - now).total_seconds())
+    return start_at, end_at, wait_seconds
+
+
+def run_silent_mode(run_minutes=None, interactive_launch=False):
+    """Scenario B: no console, no window, no tray icon. Never touches tkinter.
+
+    Launched ahead of the expected outage, it waits quietly for the scheduled
+    start, then probes continuously — the very same loop scenario A uses — and
+    re-authenticates the moment the portal starts blocking traffic. Quits on its
+    own after silent_run_minutes so nothing lingers on the machine.
+
+    interactive_launch=True (used by --silent --now) means a human started it on
+    purpose right now, so never stand by for a whole day.
+    """
+    clean_old_logs()
+    config = load_config()
+
+    if _need_setup(config):
+        notify_setup_required(config, gui=False)
+        return 1
+
+    window = plan_silent_window(config, allow_tomorrow=not interactive_launch)
+    if window is None:
+        log("Silent mode requested but silent_start_time is not set "
+            "(expected \"HH:MM\") — falling back to a plain background run", "WARN")
+        run_detection_loop(config, duration_override=run_minutes)
+        return 0
+
+    start_at, end_at, wait_seconds = window
+    if interactive_launch:
+        # --now means "start right now, do not wait for the configured time".
+        # Blocking for hours because today's HH:MM hasn't arrived yet is never
+        # what someone running --now wants, so collapse the window to now.
+        now = datetime.now()
+        log(f"--now given: skipping the wait until "
+            f"{start_at.strftime('%H:%M')}, starting immediately", "INFO")
+        start_at = now
+        end_at = now + timedelta(
+            minutes=run_minutes if run_minutes is not None
+            else max(1, int(config.get("silent_run_minutes", 30))))
+        wait_seconds = 0.0
+    log(f"Silent mode armed: probing starts at {start_at.strftime('%Y-%m-%d %H:%M:%S')}, "
+        f"service will exit at {end_at.strftime('%H:%M:%S')}", "START")
+
+    if wait_seconds > 0:
+        log(f"Standing by silently for {format_duration(wait_seconds)} "
+            f"(no window, no tray icon)", "INFO")
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(1.0, remaining))
+
+    if run_minutes is None:
+        run_minutes = max(1, int(round((end_at - start_at).total_seconds() / 60)))
+    log("Silent window open — probing for connectivity, will re-auth on outage", "START")
+    run_detection_loop(config, duration_override=run_minutes)
+    log("Silent window ended, exiting", "STOP")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=f"Campus Network Auto-Login {VERSION} — 校园网自动认证工具",
@@ -1104,13 +1421,24 @@ def main():
     parser.add_argument("--background", action="store_true", help="Background mode — no console output, detection loop only")
     parser.add_argument("--boot", action="store_true", help="Boot auto-start mode — continuous monitoring (run_duration_minutes=0), Session 0 safe")
     parser.add_argument("--version", action="version", version=f"auto_login {VERSION}")
+    parser.add_argument("--silent", action="store_true",
+                        help="Scenario B: no window, no tray — start quietly at silent_start_time, probe until the portal drops traffic, re-auth instantly, then exit after silent_run_minutes")
+    parser.add_argument("--now", action="store_true",
+                        help="With --silent: probe immediately instead of waiting for silent_start_time (for manual testing)")
+    parser.add_argument("--run-minutes", type=int, default=None, metavar="N",
+                        help="Override how many minutes the service runs (0 = forever)")
     args = parser.parse_args()
+
+    # Scenario B ignores all terminal paths — never touch input()/print()
+    if args.silent:
+        return run_silent_mode(args.run_minutes, interactive_launch=args.now)
 
     # --auth flag: test auth and exit (works in any mode)
     if args.auth:
         clean_old_logs()
         config = load_config()
         if _need_setup(config) and not INTERACTIVE:
+            notify_setup_required(config, gui=False)
             log("Config incomplete", "ERROR")
             return 1
         if _need_setup(config):
@@ -1130,6 +1458,9 @@ def main():
         clean_old_logs()
         config = load_config()
         if _need_setup(config):
+            if not _stdin_available():
+                notify_setup_required(config)
+                return 1
             log("Config incomplete — running setup first...", "WARN")
             config = interactive_setup(config)
         TrayApp(config, start_hidden=True).run()
@@ -1151,7 +1482,7 @@ def main():
     if not INTERACTIVE or args.background:
         clean_old_logs()
         config = load_config()
-        run_detection_loop(config)
+        run_detection_loop(config, duration_override=args.run_minutes)
         return
 
     print(DISCLAIMER, flush=True)

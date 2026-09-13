@@ -13,7 +13,15 @@ __pycache__/
 .vscode/
 .idea/
 
-# PyInstaller 构建产物
-build/
+# PyInstaller 构建产物（spec 是构建配方，需要纳入版本管理）
 dist/
 *.spec
+build/*
+!build/CampusNet.spec
+!build/auto_login.spec
+
+# 打包用的图标资源需要提交
+!assets/
+
+# 发布包组装用的素材（说明书等随 RELEASE_v*.md 一起维护，不必单独提交）
+packaging/

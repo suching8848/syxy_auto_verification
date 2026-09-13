@@ -30,5 +30,16 @@
     "auth_cooldown_seconds": 30,
     "_auth_cooldown_seconds说明": "认证基础冷却间隔（秒）；连续失败逐步延长，默认最长 300 秒",
     "schedule_time": "18:50",
-    "_schedule_time说明": "计划任务触发时间（HH:mm），修改后重新运行 setup_task.ps1"
+    "_schedule_time说明": "计划任务触发时间（HH:mm），修改后重新运行 setup_task.ps1",
+
+    "_图形界面": "↓↓↓ 窗口版（CampusNet.exe）专用配置 ↓↓↓",
+    "close_to_tray": true,
+    "_close_to_tray说明": "点窗口右上角 ✕ 时缩到托盘继续守护（true）还是直接退出（false）",
+
+    "_静默守护": "↓↓↓ 场景 B：每天到点静默守护、断网即刻重连 ↓↓↓",
+    "silent_start_time": "",
+    "_silent_start_time说明": "静默守护开始时刻（HH:mm，如 22:50）。留空表示不启用。部署：.\\setup_task.ps1 -Silent",
+    "silent_run_minutes": 30,
+    "_silent_run_minutes说明": "静默守护持续多少分钟后自动退出，默认 30 分钟",
+    "_静默守护行为": "到点后无窗口、无托盘图标、无任何提示；持续探测网络，一旦断网立即自动重连；跑满时长自行退出，只在 logs/ 留记录"
 }
