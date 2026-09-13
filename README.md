@@ -42,7 +42,10 @@ auto_login.py               # 主程序
 auto_login_config.json      # 配置文件（含密码，不提交 git）
 auto_login_config.example.json  # 配置模板（可提交）
 setup_task.ps1              # 一键部署到 Windows 计划任务
+test_auto_login.py          # 离线回归测试（python -m unittest test_auto_login）
 logs/                       # 运行日志（按日期，自动清理 7 天前）
+RELEASE_v*.md               # 各版本 Release 说明稿
+LICENSE                     # MIT 协议
 ```
 
 ## 快速开始
@@ -323,9 +326,13 @@ pyinstaller --onefile --console --name auto_login auto_login.py
 auto_login.exe              # 主程序
 auto_login_config.example.json  # 配置模板
 setup_task.ps1              # 计划任务部署脚本
+RELEASE_v1.6.1.md           # 本版 Release 说明
 ```
 
 对方解压后双击 exe 即可，配置向导会引导完成设置。
+
+> 发布新版时，Release 说明稿统一放在仓库根目录（`RELEASE_v*.md`），
+> 打包进 zip 后再上传到 GitHub Release，避免构建产物被清理后说明丢失。
 
 ## 附录：不兼容的 portal 怎么办
 
