@@ -317,7 +317,7 @@ python auto_login.py --auth
 
 ```powershell
 pip install pyinstaller
-pyinstaller --onefile --console --name auto_login auto_login.py
+pyinstaller --onefile --console --name auto_login --specpath build auto_login.py
 ```
 
 分发给别人需要的文件（已打包在 `auto_login_v1.6.1.zip`）：

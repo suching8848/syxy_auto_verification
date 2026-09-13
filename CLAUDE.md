@@ -28,7 +28,7 @@ python auto_login.py --boot
 python auto_login.py --version
 
 # Build standalone exe (no Python required to run)
-pyinstaller --onefile --console --name auto_login auto_login.py
+pyinstaller --onefile --console --name auto_login --specpath build auto_login.py
 
 # Deploy as daily scheduled task (PowerShell, as Administrator)
 .\setup_task.ps1

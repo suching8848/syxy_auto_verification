@@ -7,6 +7,11 @@ logs/
 
 # Python
 __pycache__/
+*.py[cod]
+
+# 编辑器 / IDE 本地配置
+.vscode/
+.idea/
 
 # PyInstaller 构建产物
 build/
