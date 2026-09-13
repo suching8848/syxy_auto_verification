@@ -3113,10 +3113,13 @@ class GuiApp:
         target = self._write_config()
         if not target:
             return
+        self._refresh_labels()          # 刚填好账号，按钮要立刻从灰变可点
         if self._monitor and self._monitor.is_alive():
             self._log("设置已保存。守护中改的账号密码，下次启动守护时生效。", "ok")
+        elif self._missing_credentials():
+            self._log("设置已保存，但账号密码还没填完整。", "warn")
         else:
-            self._log("设置已保存 ✓", "ok")
+            self._log("设置已保存 ✓ 现在可以去主页或「每天自动守护」页启动了。", "ok")
         self.settings_note.configure(text="已保存 ✓")
         self.root.after(2500, lambda: self.settings_note.configure(text=""))
 
@@ -3320,11 +3323,65 @@ class GuiApp:
         return ("powershell -NoProfile -ExecutionPolicy Bypass "
                 f"-EncodedCommand {encoded}")
 
+    # 示例配置里的占位符：照抄 example 就没改过的用户会留下这些值
+    PLACEHOLDERS = {"你的学号", "你的密码", "your_username", "your_password"}
+
+    def _filled(self, value):
+        text = str(value or "").strip()
+        return bool(text) and text not in self.PLACEHOLDERS
+
+    def _missing_credentials(self):
+        """返回一句说明，列出还缺哪些必填项；配置齐全时返回 None。
+
+        这是防呆的核心：每日任务在凌晨静默运行，失败时**没有任何界面可提示**
+        （这正是静默模式的意义），所以必须在"创建任务"这一步就拦住，
+        否则用户会得到一个到点必然失败、且悄无声息的任务。
+
+        不复用 core._need_setup()：它面向命令行向导，语义不同（例如它把
+        "http 模式只需 portal_url" 之外的情况也算需要配置）。这里按 GUI 的
+        实际用法定制，并额外把示例里的占位符当成"没填"。
+        """
+        cfg = self._config
+        method = cfg.get("auth_method", "portal_post")
+        missing = []
+        if method == "portal_post":
+            if not self._filled(cfg.get("username")):
+                missing.append("学号 / 账号")
+            if not self._filled(cfg.get("password")):
+                missing.append("密码")
+        else:
+            if not self._filled(cfg.get("portal_url")):
+                missing.append("校园网认证地址")
+        if not missing:
+            return None
+        return "、".join(missing) + f"（认证方式：{method}）"
+
+    def _require_credentials(self):
+        """缺项时提示并跳到设置页。返回 True 表示可以继续。"""
+        missing = self._missing_credentials()
+        if missing is None:
+            return True
+        self._log(f"还差：{missing} —— 已切到「设置」页，填好保存后再来。", "error")
+        try:
+            self.notebook.select(self.tab_settings)
+        except Exception:
+            pass
+        messagebox.showwarning(
+            "先把账号密码填上",
+            f"还缺：{missing}\n\n"
+            "现在创建任务的话，它到点会启动、但因为没有账号密码而直接退出，"
+            "而且不会有任何提示（静默模式不弹窗），你只会发现网络没恢复。\n\n"
+            "已经帮你切到「设置」页，填好后点「保存设置」，再回来点这个按钮。")
+        return False
+
     def _deploy_silent_task(self):
         if self.mode_var.get() != "silent":
             self.mode_var.set("silent")
         target = self._write_config()
         if not target:
+            return
+        if not self._require_credentials():
+            self.mode_note.configure(text="配置不完整，任务没有创建。", fg="#cc2b2b")
             return
         start_at = self._config["silent_start_time"]
         run_min = self._config["silent_run_minutes"]
@@ -3385,6 +3442,9 @@ class GuiApp:
     def _test_silent_now(self):
         """不起窗口，直接跑一次静默守护，让用户确信它真的不显示任何东西。"""
         self._write_config()
+        if not self._require_credentials():
+            self.mode_note.configure(text="配置不完整，没有试跑。", fg="#cc2b2b")
+            return
         exe = sys.executable
         try:
             if getattr(sys, "frozen", False):
@@ -3409,18 +3469,35 @@ class GuiApp:
                                fill=STATE_COLOR.get(self._state, "#8a8a8a"))
         self.state_label.configure(text=STATE_TEXT.get(self._state, "待命中"))
 
+        # 防呆：缺账号密码时，两个"启动"按钮一律不可用。
+        # 守护循环本身也有守卫（start_monitor / run_silent_mode 都会拒绝），
+        # 这里只是让用户一眼看出"还没配好"，而不是点了才发现。
+        missing = self._missing_credentials()
+
         running = bool(self._monitor and self._monitor.is_alive())
         # 主按钮
         if running:
             self.primary_btn.configure(text="■  停止守护", bg="#b8730a",
                                        activebackground="#9c6108", state="normal")
+        elif missing:
+            self.primary_btn.configure(text="请先在「设置」页填账号密码", bg="#c9ced6",
+                                       activebackground="#c9ced6", state="disabled")
         else:
             self.primary_btn.configure(text="▶  开始守护", bg="#1f6feb",
                                        activebackground="#1a5fd0", state="normal")
         self.stop_btn.configure(state="normal" if running else "disabled")
         self.auth_btn.configure(
-            state="disabled" if (self._auth_thread and self._auth_thread.is_alive())
+            state="disabled" if (missing or (self._auth_thread
+                                             and self._auth_thread.is_alive()))
             else "normal")
+
+        # 每天自动守护页的按钮
+        if missing:
+            self.deploy_btn.configure(text="请先填账号密码再开启", bg="#c9ced6",
+                                      activebackground="#c9ced6", state="disabled")
+        else:
+            self.deploy_btn.configure(text="开启每天自动守护", bg="#1f6feb",
+                                      activebackground="#1a5fd0", state="normal")
 
         # 副标题
         if self._state == STATE_PENDING:
