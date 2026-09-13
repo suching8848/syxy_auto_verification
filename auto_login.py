@@ -1,6 +1,6 @@
 import urllib.request
 import urllib.error
-from urllib.parse import urlparse, urlencode
+from urllib.parse import urlparse, urlencode, urljoin
 import http.cookiejar
 import webbrowser
 import json
@@ -58,7 +58,7 @@ DEFAULT_CONFIG = {
     "username": "",
     "password": "",
     # scheduled task trigger time (24h format)
-    "schedule_time": "19:45",
+    "schedule_time": "20:30",
 }
 
 # True when user runs `python auto_login.py` directly (has a console)
@@ -125,17 +125,28 @@ def format_duration(seconds):
 
 def check_network(url, timeout, expected_body=None):
     """Returns (ok: bool, detail: str).
-    Checks for captive portal via URL redirect AND response body content."""
-    expected_host = urlparse(url).hostname
+    Checks for captive portal via URL redirect AND response body content.
+
+    Same-site http->https upgrades (e.g. baidu.com 301 to https) are normal
+    and must NOT be treated as a portal redirect, otherwise a healthy network
+    is reported as down — which both triggers bogus auth attempts and makes
+    every post-auth verification fail."""
+    expected = urlparse(url)
     try:
         req = urllib.request.Request(url, method="GET")
         resp = urllib.request.urlopen(req, timeout=timeout)
         final_url = resp.geturl()
-        final_host = urlparse(final_url).hostname
-        if final_host and expected_host and final_host != expected_host:
-            return False, f"portal redirect to {final_host}"
-        if final_url != url:
-            return False, f"redirected to {final_url[:100]}"
+        final = urlparse(final_url)
+        same_site = (
+            final.hostname == expected.hostname
+            and (final.path or "/") == (expected.path or "/")
+            and final.query == expected.query
+        )
+        if not same_site:
+            if final.hostname and expected.hostname and final.hostname != expected.hostname:
+                return False, f"portal redirect to {final.hostname}"
+            if final_url != url:
+                return False, f"redirected to {final_url[:100]}"
         if expected_body:
             body = resp.read(102400).decode("utf-8", errors="ignore")
             if expected_body.lower() not in body.lower():
@@ -173,7 +184,7 @@ BROWSER_HEADERS = {
         "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
     ),
     "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate",
+    "Accept-Encoding": "identity",
     "Upgrade-Insecure-Requests": "1",
     "Connection": "keep-alive",
 }
@@ -264,7 +275,7 @@ def do_auth_portal_post(config):
     Step 1: fallback — access portal index.jsp directly, then try API
     Step 2: POST credentials to InterFace.do?method=login
     """
-    portal_host = config.get("portal_url") or config.get("portal_host", "")
+    portal_host = config.get("portal_url", "")
     username = config.get("username", "")
     password = config.get("password", "")
     check_url = config["check_url"]
@@ -301,49 +312,12 @@ def do_auth_portal_post(config):
     except Exception as e:
         log(f"Probe {check_url}: {e}", "AUTH")
 
-    # Step 0.5: if already online (no redirect), try logout to force captive portal re-trigger
-    if not index_url:
-        log("Already online — trying logout APIs to trigger captive portal...", "AUTH")
-        for logout_method in ("logout", "offline", "disconnect"):
-            try:
-                logout_url = f"{portal_host}/eportal/InterFace.do?method={logout_method}"
-                req = urllib.request.Request(logout_url, headers={
-                    "User-Agent": BROWSER_UA,
-                    "Referer": f"{portal_host}/eportal/index.jsp",
-                })
-                resp = opener.open(req, timeout=timeout)
-                body = resp.read(204800).decode("utf-8", errors="ignore")
-                log(f"Logout '{logout_method}': {body[:200]}", "AUTH")
-                # if logout succeeded (or user already offline), re-probe for portal redirect
-                if any(kw in body for kw in ["成功", "success", "已不在线", "已下线", "下线成功"]):
-                    log("Logout OK, re-probing network for captive portal...", "AUTH")
-                    time.sleep(2)
-                    try:
-                        req2 = urllib.request.Request(check_url, headers=BROWSER_HEADERS)
-                        resp2 = opener.open(req2, timeout=timeout)
-                        body2 = resp2.read(204800).decode("utf-8", errors="ignore")
-                        final2 = resp2.geturl()
-                        if final2 != check_url and "index.jsp" in final2:
-                            index_url = final2
-                            log(f"Got redirect after logout: {index_url[:150]}", "AUTH")
-                        else:
-                            m2 = re.search(r"location\.href\s*=\s*['\"]([^'\"]*index\.jsp[^'\"]*)", body2)
-                            if m2:
-                                index_url = m2.group(1)
-                                log(f"Got JS redirect after logout: {index_url[:150]}", "AUTH")
-                            else:
-                                log("No portal redirect after logout — portal logout may be unreliable", "AUTH")
-                    except Exception as e2:
-                        log(f"Re-probe after logout failed: {e2}", "AUTH")
-                    break  # stop trying other logout methods
-            except Exception as e:
-                log(f"Logout '{logout_method}' error: {e}", "AUTH")
-
     # Step 1: if no JS redirect found, try accessing portal directly
     if not index_url:
         index_url = f"{portal_host}/eportal/index.jsp"
         log(f"No JS redirect, accessing portal directly: {index_url}", "AUTH")
 
+    index_url = urljoin(portal_host + "/eportal/", index_url)
     # GET index.jsp to obtain JSESSIONID cookie (needed for both paths)
     index_body = ""
     try:
@@ -443,8 +417,11 @@ def do_auth_portal_post(config):
         body = resp.read().decode("utf-8", errors="ignore")
         elapsed = (time.time() - start) * 1000
         snippet = body[:200].replace("\n", " ").strip()
-        body_lower = body.lower() if body else ""
-        if '"result":"fail"' in body_lower or '"result":"fail"' in body:
+        try:
+            result = json.loads(body)
+        except (ValueError, TypeError):
+            result = {}
+        if not isinstance(result, dict) or result.get("result") != "success":
             log(f"Auth FAIL [HTTP {resp.status}, {elapsed:.0f}ms] body: {snippet}", "ERROR")
             return False
         log(f"Auth OK [HTTP {resp.status}, {elapsed:.0f}ms] body: {snippet}", "AUTH")
@@ -495,7 +472,8 @@ def do_auth(config, last_auth_time):
     timeout = config["request_timeout"]
 
     if method == "portal_post":
-        return do_auth_portal_post(config)
+        if not do_auth_portal_post(config):
+            return False
     elif method == "browser":
         do_auth_browser(url, config.get("browser_wait_seconds", 3))
         log("Browser auth completed (Enter sent)", "AUTH")
@@ -504,7 +482,7 @@ def do_auth(config, last_auth_time):
         status, body, info = do_auth_http(url, timeout)
         elapsed = (time.time() - start) * 1000
         snippet = body[:200].replace("\n", " ").strip() if body else "(empty)"
-        if status:
+        if status and 200 <= status < 300:
             body_lower = body.lower() if body else ""
             if "fail" in body_lower or "error" in body_lower:
                 log(f"Auth FAIL [{info}, {elapsed:.0f}ms] body: {snippet}", "ERROR")
@@ -515,7 +493,16 @@ def do_auth(config, last_auth_time):
             log(f"Auth FAIL [{info}, {elapsed:.0f}ms]", "ERROR")
             return False
 
-    return True
+    # The portal response alone does not establish Internet connectivity.
+    for attempt in range(3):
+        if attempt:
+            time.sleep(1)
+        ok, detail = check_network(config["check_url"], timeout,
+                                   config.get("check_expected_body"))
+        if ok:
+            return True
+    log(f"Auth response received but network is unavailable: {detail}", "ERROR")
+    return False
 
 
 def _input(prompt, default=""):
@@ -533,7 +520,7 @@ def _input(prompt, default=""):
 
 def show_seamless_guide(config):
     """Print guide for achieving fully seamless (no-popup) auth."""
-    stime = config.get("schedule_time", "17:55")
+    stime = config.get("schedule_time", "20:30")
     stime_early = _shift_time(stime, -2)
     print()
     print("=" * 66)
@@ -594,8 +581,8 @@ def show_seamless_guide(config):
     print(f"    5. 看到绿色提示即成功！每天 {stime} 自动启动。")
     print()
     print("  ▸ 修改触发时间：")
-    print("    用记事本打开 setup_task.ps1，找到 -Daily -At")
-    print("    把时间改成你想要的（24 小时制，如 17:58），")
+    print("    在菜单 [3] 修改 schedule_time，或编辑配置文件")
+    print("    使用 HH:mm 格式（如 17:58），")
     print("    保存后重新运行 .\\setup_task.ps1 即可。")
     print()
     print("  ▸ 替代方案：开机自启动（不需要每天同一时间触发）：")
@@ -642,7 +629,7 @@ def interactive_setup(config):
         ("username", "学号/用户名", "你的学号"),
         ("password", "校园网密码", "你的密码"),
         ("portal_url", "校园网认证地址 (不知道可以不填)", "http://10.10.200.102"),
-        ("schedule_time", "定时触发时间 (24h制)", "17:55"),
+        ("schedule_time", "定时触发时间 (24h制)", "20:30"),
         ("check_url", "网络检测地址", "http://www.baidu.com"),
     ]
 
@@ -697,7 +684,7 @@ def show_menu():
     print()
     print("  [4] 定时部署")
     print("      已知每天断网时间 → 设置 Windows 计划任务定时触发")
-    print("      适合：校园网每天固定时间断网（如每晚 17:55）")
+    print("      适合：校园网每天固定时间断网（如每晚 20:30）")
     print()
     print("  [5] 后台常驻")
     print("      不知道断网时间 → 托盘图标常驻后台，断网自动重连")
@@ -721,7 +708,9 @@ class TrayApp:
     Uses ctypes to call Win32 Shell_NotifyIcon API — zero external dependencies."""
 
     def __init__(self, config, start_hidden=False):
-        self._config = config
+        self._config = config.copy()
+        if start_hidden:
+            self._config["run_duration_minutes"] = 0
         self._stop_event = threading.Event()
         self._worker = None
         self._status = "Initializing..."
@@ -800,6 +789,9 @@ class TrayApp:
             elif msg == WM_USER_TRAY_UPDATE:
                 self._update_tooltip(self._status)
                 return 0
+            elif msg == WM_USER + 2:
+                self._request_exit()
+                return 0
             elif msg == 0x0002:  # WM_DESTROY
                 ctypes.windll.user32.PostQuitMessage(0)
                 return 0
@@ -836,8 +828,7 @@ class TrayApp:
         if not ctypes.windll.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
             raise RuntimeError("Shell_NotifyIcon NIM_ADD failed")
 
-        nid.uVersion = NOTIFYICON_VERSION_4
-        ctypes.windll.shell32.Shell_NotifyIconW(NIM_SETVERSION, ctypes.byref(nid))
+        # Keep the default callback format: lParam is the mouse message.
 
     def _update_tooltip(self, text):
         nid = _NOTIFYICONDATAW()
@@ -914,6 +905,9 @@ class TrayApp:
             )
         except Exception as e:
             log(f"Tray worker crashed: {e}", "ERROR")
+        finally:
+            if self._hwnd:
+                ctypes.windll.user32.PostMessageW(self._hwnd, WM_USER + 2, 0, 0)
 
     def _on_status(self, status_line):
         """Called from worker thread. Post message to main thread for tooltip update."""
@@ -935,6 +929,40 @@ class TrayApp:
 
 
 # ── End of TrayApp ───────────────────────────────────────────────────────────
+
+
+def tcp_reachable(host, port=80, timeout=2):
+    """True if a TCP connection to host:port succeeds. Distinguishes
+    'no connectivity at all' from 'reachable but content looks wrong'."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def log_failure_context(url, detail):
+    """When the online check fails, record whether the host was at least
+    reachable. A reachable host with a failed check means either the portal is
+    transparently proxying (no redirect) or a redirect we refuse to follow —
+    useful for telling a real outage apart from a portal that never hijacked."""
+    host = urlparse(url).hostname
+    if not host:
+        return
+    ok = tcp_reachable(host)
+    if ok:
+        log(
+            f"Detail: {detail} — remote host is TCP-reachable, so this is NOT a "
+            f"plain outage (portal may be proxying without redirecting, or a "
+            f"redirect we treat as portal)",
+            "WARN",
+        )
+    else:
+        log(f"Detail: {detail} — remote host unreachable (genuine outage or DNS failure)", "WARN")
 
 
 def run_detection_loop(config, stop_event=None, status_callback=None):
@@ -966,7 +994,8 @@ def run_detection_loop(config, stop_event=None, status_callback=None):
     outage_checks = 0
     outage_start = None
     auth_attempts = 0
-    last_auth_time = None
+    next_auth_at = 0.0
+    auth_failures = 0
     was_down = False
 
     while not (stop_event and stop_event.is_set()):
@@ -991,6 +1020,7 @@ def run_detection_loop(config, stop_event=None, status_callback=None):
                     outage_checks = 0
                     auth_attempts = 0
                 fail_count = 0
+                auth_failures = 0
             else:
                 fail_count += 1
                 if not outage_start:
@@ -1000,21 +1030,26 @@ def run_detection_loop(config, stop_event=None, status_callback=None):
                 if fail_count >= fail_threshold:
                     if not was_down:
                         log(f"Network DOWN (reason: {detail}), starting auth", "DOWN")
+                        log_failure_context(check_url, detail)
                         was_down = True
                         outage_start = datetime.now()
                         outage_checks = 0
                         auth_attempts = 0
 
-                    auth_attempts += 1
-                    if do_auth(config, last_auth_time):
-                        last_auth_time = datetime.now()
+                    if time.monotonic() >= next_auth_at:
+                        auth_attempts += 1
+                        authenticated = do_auth(config, None)
+                        auth_failures = 0 if authenticated else auth_failures + 1
+                        cooldown = max(1, config.get("auth_cooldown_seconds", 30))
+                        delay = min(max(300, cooldown), cooldown * 2 ** min(max(0, auth_failures - 1), 10))
+                        next_auth_at = time.monotonic() + delay
                     fail_count = 0
                 else:
                     log(f"Check #{fail_count} failed: {detail}", "WARN")
 
             # build status line for tray tooltip / interactive console
             uptime = format_duration((datetime.now() - start_time).total_seconds())
-            sleep = interval_fail if was_down else interval_ok
+            sleep = interval_fail if was_down or fail_count else interval_ok
 
             if was_down and outage_start:
                 state = f"[DOWN] outage {format_duration((datetime.now() - outage_start).total_seconds())} | auth #{auth_attempts + 1}"
@@ -1033,7 +1068,7 @@ def run_detection_loop(config, stop_event=None, status_callback=None):
                 log(status_line, "STATUS")
 
             # interruptible sleep — check stop_event every 0.5s
-            _sleep = interval_fail if was_down else interval_ok
+            _sleep = sleep
             for _ in range(int(_sleep * 2)):
                 if stop_event and stop_event.is_set():
                     break
@@ -1054,7 +1089,9 @@ def _need_setup(config):
     """Check if config needs first-time setup."""
     method = config.get("auth_method", "http")
     if method == "portal_post":
-        return not config.get("username") or not config.get("password")
+        return (not config.get("username") or not config.get("password")
+                or config.get("username") == "你的学号"
+                or config.get("password") == "你的密码")
     return not config.get("portal_url")
 
 
@@ -1068,6 +1105,25 @@ def main():
     parser.add_argument("--boot", action="store_true", help="Boot auto-start mode — continuous monitoring (run_duration_minutes=0), Session 0 safe")
     parser.add_argument("--version", action="version", version=f"auto_login {VERSION}")
     args = parser.parse_args()
+
+    # --auth flag: test auth and exit (works in any mode)
+    if args.auth:
+        clean_old_logs()
+        config = load_config()
+        if _need_setup(config) and not INTERACTIVE:
+            log("Config incomplete", "ERROR")
+            return 1
+        if _need_setup(config):
+            log("Config incomplete — running setup first...", "WARN")
+            config = interactive_setup(config)
+        method = config.get("auth_method", "http")
+        if method == "portal_post":
+            log("Auth test mode: method=portal_post", "START")
+        else:
+            log(f"Auth test mode: method={method}", "START")
+        ok = do_auth(config, None)
+        log(f"Auth test {'PASSED' if ok else 'FAILED'}", "STOP")
+        return 0 if ok else 1
 
     # --tray: start tray in current process (no subprocess — tray icon created first)
     if args.tray:
@@ -1103,20 +1159,6 @@ def main():
     clean_old_logs()
 
     config = load_config()
-
-    # --auth flag: test auth and exit (works in any mode)
-    if args.auth:
-        if _need_setup(config):
-            log("Config incomplete — running setup first...", "WARN")
-            config = interactive_setup(config)
-        method = config.get("auth_method", "http")
-        if method == "portal_post":
-            log("Auth test mode: method=portal_post", "START")
-        else:
-            log(f"Auth test mode: method={method}", "START")
-        ok = do_auth(config, None)
-        log(f"Auth test {'PASSED' if ok else 'FAILED'}", "STOP")
-        return
 
     # Interactive mode with no flags: show menu
     while True:
@@ -1230,7 +1272,7 @@ def main():
 if __name__ == "__main__":
     _tray_mode = "--tray" in sys.argv
     try:
-        main()
+        sys.exit(main())
     finally:
-        if INTERACTIVE and not _tray_mode:
+        if INTERACTIVE and not any(flag in sys.argv for flag in ("--tray", "--background", "--boot", "--auth", "--version", "--help", "-h")):
             input("\nPress Enter to exit...")

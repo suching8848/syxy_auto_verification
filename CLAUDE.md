@@ -43,20 +43,20 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 Unregister-ScheduledTask -TaskName CampusNetAutoLogin_Boot -Confirm:$false
 ```
 
-No build, lint, or test steps. Python 3 standard library only, no pip dependencies (except `pyinstaller` for exe packaging).
+Offline regression tests: `python -m unittest -v test_auto_login` (Windows). Python 3 standard library only, no pip dependencies (except `pyinstaller` for exe packaging).
 
 ## Architecture
 
 Single-file script (`auto_login.py`) with JSON config (`auto_login_config.json`).
 
 **Five run modes:**
-- `INTERACTIVE` (try/except on `sys.stdout.isatty()`, defaults False if stdout is None) — when run from a terminal, shows interactive menu (options 1-6, q), then runs detection loop inside a `TrayApp` (with visible console). Menu options: [1] Launch with tray, [2] Test auth, [3] Edit config, [4] Scheduled task guide, [5] Background tray (hidden), [6] FAQ, [q] Quit.
+- `INTERACTIVE` (try/except on `sys.stdout.isatty()`, defaults False if stdout is None) — when run from a terminal, shows interactive menu (options 1-6, q), then runs detection loop inside a `TrayApp` (with visible console). Menu options: [1] 启动自动认证 (start detection loop with tray), [2] 测试认证 (test auth), [3] 修改基本配置 (edit config), [4] 定时部署 (scheduled task deployment guide), [5] 后台常驻 (background resident — hidden tray), [6] 使用帮助 (FAQ), [q] Quit.
 - `--background` — forces background mode regardless of `isatty()`, calls `run_detection_loop` directly. Used by `setup_task.ps1`.
 - `--tray` — starts `TrayApp` with `start_hidden=True` directly, no menu. Notification area icon only.
 - `--boot` — overrides `run_duration_minutes` to 0, logs Session 0 warnings, calls `run_detection_loop` directly. Used by `setup_task.ps1 -Boot`.
 - Auto-detected background — when `not INTERACTIVE` (pythonw.exe has no stdout), skips menu and tray, calls `run_detection_loop` directly. Logs key events (START/DOWN/AUTH/RECOVER/STOP) + STATUS every 2 checks (≈10s).
 
-**`--auth` flag** bypasses all paths — does a single auth attempt and exits. If already online, tries portal logout APIs first to trigger captive portal redirect and get real auth parameters. Triggers config wizard if config is incomplete.
+**`--auth` flag** bypasses all paths — does a single auth attempt and exits. Never logs out automatically; returns exit code 0 on verified connectivity and 1 on failure. Triggers config wizard if config is incomplete.
 
 **exe vs script mode** detected via `sys.frozen` (PyInstaller sets this). Affects `SCRIPT_DIR` resolution and the exe shows a pre-exit "Press Enter" prompt so the console doesn't vanish.
 
@@ -86,11 +86,11 @@ Signature: `run_detection_loop(config, stop_event=None, status_callback=None)`
 1. **`portal_post`** (default, for portals requiring username/password POST):
    - GET check_url with full browser headers → portal returns JS redirect (`location.href='...index.jsp?...'`)
    - Regex-extract index.jsp URL (carries connection params: wlanuserip, nasip, mac, etc.)
-   - If already online (no redirect), tries portal logout APIs (logout/offline/disconnect), then re-probes
+   - No redirect: accesses the portal directly; never calls logout APIs
    - GET index.jsp → obtain JSESSIONID cookie
    - Fallback param extraction: hidden `<input>` fields, JS `var` declarations, local IP via socket
    - POST to `InterFace.do?method=login` with username, password, queryString, and cookie
-   - Checks response for `"result":"fail"` to detect auth failure
+   - Parses JSON and requires `result == "success"`; then verifies Internet connectivity
    - Requires config: `portal_url`, `username`, `password`
 
 2. **`http`** (simple GET-based auth):
@@ -115,7 +115,7 @@ Signature: `run_detection_loop(config, stop_event=None, status_callback=None)`
 1. `check_network()` on `check_url` at configured interval
 2. On failure, retry at `check_interval_fail` interval; after `fail_threshold` consecutive failures, trigger auth
 3. On success, wait `check_interval_ok` seconds before next check
-4. Auth cooldown (`auth_cooldown_seconds`, default 30s) prevents repeated auth attempts
+4. Monotonic retry deadlines cover failed and successful attempts; consecutive failures exponentially back off from the configured cooldown (default 30s) up to max(300s, cooldown)
 5. Runs until `run_duration_minutes` (default 60, `0` = infinite) elapses, `stop_event` is set, or Ctrl+C
 
 ### Logging
@@ -124,16 +124,16 @@ Dual output — always prints to stdout/stderr; also appends to `logs/auto_login
 
 ### Config
 
-`_need_setup(config)` checks whether core fields are missing (username+password for portal_post, portal_url for others). Triggers `interactive_setup()` wizard on first run if config is incomplete. `DEFAULT_CONFIG` also includes `schedule_time` (default `"17:55"`) for the scheduled task and `browser_wait_seconds` (default `3`) for browser auth mode.
+`_need_setup(config)` checks whether core fields are missing (username+password for portal_post, portal_url for others). Triggers `interactive_setup()` wizard on first run if config is incomplete. `DEFAULT_CONFIG` also includes `schedule_time` (default `"20:30"`) for the scheduled task and `browser_wait_seconds` (default `3`) for browser auth mode.
 
 ### `setup_task.ps1`
 
-- **Daily mode** (no flags): creates `CampusNetAutoLogin` task with `-Daily -At "19:45"` trigger
+- **Daily mode** (no flags): creates `CampusNetAutoLogin` task using config `schedule_time` (default 20:30), overridable with `-ScheduleTime HH:mm`
 - **Boot mode** (`-Boot`): creates `CampusNetAutoLogin_Boot` task with `-AtStartup` trigger
 - Prefers `auto_login.exe` if present → launches via `powershell.exe Start-Process -WindowStyle Hidden` (fully hidden); boot mode appends `--boot` argument
 - Falls back to `pythonw.exe` (no console window), then `python.exe`; searches PATH first, then common Python install locations
 - Daily task: `LogonType Interactive` (required for browser mode + `keybd_event`), `RunLevel Limited`, 2-hour execution time limit, `RestartCount 0`
-- Boot task: `LogonType S4U` with `UserId SYSTEM` (Session 0, no user logon required), `ExecutionTimeLimit 0` (unlimited), `RestartCount 3` with 1-minute interval
+- Boot task: `LogonType ServiceAccount` with `UserId SYSTEM` (Session 0, no user logon required), `ExecutionTimeLimit 0` (unlimited), `RestartCount 3` with 1-minute interval
 - `Hidden=$true` on task settings, ignores new instances if already running
 - Uses `param([switch]$Boot)` to toggle between daily and boot mode
 
@@ -147,3 +147,26 @@ Dual output — always prints to stdout/stderr; also appends to `logs/auto_login
 - `socket` — get local IP as fallback for queryString construction
 - `argparse` — CLI flags (`--auth`, `--tray`, `--background`, `--boot`, `--version`)
 - `sys.frozen` (PyInstaller) — distinguishes exe vs script for path resolution and exit behavior
+
+## Development gotchas
+
+**Critical: `print()` ordering in `main()`.**
+The background mode check (`if not INTERACTIVE or args.background:`) MUST execute before any `print()` call. Under `pythonw.exe` (Task Scheduler), `sys.stdout` is `None` and `print()` throws. If you add logging or output before this check you will break background mode. The `INTERACTIVE` flag is set at module level with a try/except: `try: INTERACTIVE = sys.stdout.isatty()` / `except: INTERACTIVE = False`.
+
+**`TrayApp` has a built-in fallback.** If `_create_window()` or `_create_tray_icon()` raises (e.g., no desktop session), `TrayApp.run()` catches the exception and falls back to `run_detection_loop(config)` — this is a console-less fallback, not the tray app.
+
+**`_need_setup` checks different fields per `auth_method`.**
+`portal_post` requires `username` + `password`; `http` and `browser` require `portal_url`. This affects when the config wizard triggers.
+
+**`__main__` finally block.** Interactive mode (non-tray) has a `finally:` block that prompts `input("\nPress Enter to exit...")`. This prevents the console from instantly vanishing when running as `auto_login.exe` (PyInstaller). Tray mode skips this via the `_tray_mode` flag.
+
+**JSON config contains plaintext passwords.** `auto_login_config.json` is in `.gitignore` and must never be committed. The example config (`auto_login_config.example.json`) uses `_`-prefixed keys as pseudo-comments since JSON has no comment syntax.
+
+**`setup_task.ps1` exe/script detection order.** The script checks `auto_login.exe` first → `pythonw.exe` (no window) → `python.exe` (fallback). If `auto_login.exe` exists, it's launched via `powershell.exe Start-Process -WindowStyle Hidden` for true zero-window execution. Python fallbacks pass `--background` (or `--boot`) to suppress console output.
+
+## Reliability updates
+
+- Hidden resident tray mode overrides duration to 0 on a config copy. Worker completion posts a UI message to close the tray.
+- EXE scheduled launcher passes --background/--boot, waits for completion, and propagates exit status; Python script paths are quoted.
+- Explicit CLI modes do not wait for Enter on exit.
+- Run offline tests before packaging; existing dist artifacts are not updated by source edits.

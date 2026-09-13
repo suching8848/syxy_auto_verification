@@ -28,12 +28,12 @@
 | # | 模式 | 入口 | 说明 |
 |---|------|------|------|
 | 1 | **交互终端** | `python auto_login.py` → 菜单 [1] | 持续检测 + 断网自动重连，终端可见 |
-| 2 | **认证测试** | `--auth` 或菜单 [2] | 单次认证验证（已在线时可能不可靠 — portal logout API 不稳定） |
+| 2 | **认证测试** | `--auth` 或菜单 [2] | 单次认证并验证联网，退出码 0 成功、1 失败 |
 | 3 | **无感部署** | 菜单 [4] → `setup_task.ps1` | 每天定时触发，通过 Windows 计划任务后台静默运行 |
 | 4 | **系统托盘** | `--tray` 或菜单 [5] | 隐藏终端窗口，通知区域显示图标；鼠标悬停查看状态，右键退出 |
 | 5 | **开机自启** | `setup_task.ps1 -Boot` | 系统启动时自动运行，持续监控网络，断网即重连。Session 0 运行，无需用户登录 |
 
-> **模式 2 说明**：`--auth` 在已登录状态下会先尝试调 portal 登出 API 再重认证。但部分 portal 的登出 API 不可靠（返回成功但实际未下线），此时可能报 FAILED。**最准确的测试方式是在断网时运行。**
+> **模式 2 说明**：认证测试和自动重连都不会主动登出。`portal_post` 必须收到明确的成功 JSON，并通过后续联网检测才算成功；已在线时可能缺少认证参数，建议在自然断网时测试。
 
 ## 文件说明
 
@@ -131,13 +131,13 @@ cd "你的程序目录"    # 例如 cd "C:\Users\xxx\Desktop\校园网认证"
 
 脚本做了以下事情：
 - **自动选择运行方式**：优先使用 exe（通过 `powershell.exe Start-Process -WindowStyle Hidden` 启动），没有 exe 则用 Python（优先 `pythonw.exe` 无窗口）
-- **注册计划任务**：任务名 `CampusNetAutoLogin`，每天 19:45 触发，运行 60 分钟后自动退出
+- **注册计划任务**：任务名 `CampusNetAutoLogin`，按 `schedule_time` 触发（默认 18:50），运行 60 分钟后自动退出
 - **任务配置**：`LogonType Interactive`（支持 browser 模式模拟按键）、`Hidden=$true`（不弹窗口）、2 小时执行时限、已有实例运行时忽略新实例
 
-修改触发时间编辑 `setup_task.ps1` 中的 `$trigger` 行：
+部署脚本读取配置中的 `schedule_time`（缺省 18:50）；修改配置后需要重新部署。也可显式覆盖：
 
 ```powershell
-$trigger = New-ScheduledTaskTrigger -Daily -At "19:45"   # 改成你的时间
+.\setup_task.ps1 -ScheduleTime "18:50"
 ```
 
 修改运行时长编辑 `auto_login_config.json`：
@@ -239,7 +239,7 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 | `fail_threshold` | `2` | 连续失败多少次后触发认证 |
 | `request_timeout` | `5` | HTTP 请求超时（秒） |
 | `run_duration_minutes` | `60` | 运行多久自动退出（分钟），`0` 为无限 |
-| `auth_cooldown_seconds` | `30` | 两次认证的最小间隔，防止频繁认证 |
+| `auth_cooldown_seconds` | `30` | 认证重试基础间隔；连续失败按 30、60、120…秒退避，默认上限 300 秒 |
 
 **portal_post 模式字段：**
 
@@ -248,7 +248,7 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 | `portal_url` | 校园网认证服务器地址（默认三亚学院 `http://10.10.200.102`） |
 | `username` | 校园网用户名 / 学号 |
 | `password` | 校园网密码 |
-| `schedule_time` | 计划任务触发时间（24h 制，修改 `setup_task.ps1` 第 68 行） |
+| `schedule_time` | 计划任务触发时间（HH:mm），修改后重新运行部署脚本 |
 
 **http / browser 模式字段：**
 
@@ -267,7 +267,7 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 2. 正则提取 index.jsp 完整 URL（含 `wlanuserip`、`nasip`、`mac` 等连接参数）
 3. GET index.jsp → 拿到 `JSESSIONID` cookie
 4. POST `InterFace.do?method=login`，携带用户名、密码、queryString、cookie
-5. Portal 返回 `result:success` → 认证完成
+5. 解析 JSON，确认 `result` 为 `success`，再检测联网（最多 3 次）确认恢复
 
 全程后台 HTTP 请求，不弹浏览器。
 
@@ -323,6 +323,7 @@ pyinstaller --onefile --console --name auto_login auto_login.py
 auto_login.exe              # 主程序
 auto_login_config.example.json  # 配置模板
 setup_task.ps1              # 计划任务部署脚本
+```
 
 对方解压后双击 exe 即可，配置向导会引导完成设置。
 
@@ -416,3 +417,15 @@ Start-Process chrome -ArgumentList "--auto-open-devtools-for-tabs", "http://www.
 - Python 3（仅标准库，无需 pip 安装）
 - Windows 10/11
 - （exe 版本无需任何依赖）
+
+## 维护与验证
+
+托盘常驻（`--tray` / 菜单 [5]）无限监控；其他托盘运行在检测结束时自动关闭图标。认证失败也受冷却限制，首次检测失败即切换到快速确认间隔。计划任务的 EXE 启动器会等待程序结束并传递退出码，Python 路径支持空格。
+
+在 Windows 上运行离线回归测试（不连接校园网）：
+
+```powershell
+python -m unittest -v test_auto_login
+```
+
+修改源码后需重新打包 EXE，`dist/` 中原有发布文件不会自动更新。

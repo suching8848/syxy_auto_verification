@@ -1,19 +1,33 @@
-param([switch]$Boot)
+param([switch]$Boot, [string]$ScheduleTime)
 
 $ErrorActionPreference = "Stop"
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $taskName = if ($Boot) { "CampusNetAutoLogin_Boot" } else { "CampusNetAutoLogin" }
+if (-not $Boot) {
+    if (-not $ScheduleTime) {
+        $configPath = Join-Path $scriptDir "auto_login_config.json"
+        if (Test-Path -LiteralPath $configPath) {
+            $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $ScheduleTime = $config.schedule_time
+        }
+        if (-not $ScheduleTime) { $ScheduleTime = "20:30" }
+    }
+    if ($ScheduleTime -notmatch '^([01]\d|2[0-3]):[0-5]\d$') {
+        throw "schedule_time must use HH:mm format"
+    }
+}
 
 # Check for auto_login.exe first (no Python needed, runs hidden via Start-Process)
 $exePath = Join-Path $scriptDir "auto_login.exe"
 
 if (Test-Path $exePath) {
-    $exeArgs = if ($Boot) { " -ArgumentList '--boot'" } else { "" }
+    $exeArgs = if ($Boot) { "--boot" } else { "--background" }
+    $escapedExePath = $exePath.Replace("'", "''")
     $action = New-ScheduledTaskAction `
         -Execute "powershell.exe" `
         -WorkingDirectory $scriptDir `
-        -Argument "-NoProfile -WindowStyle Hidden -Command Start-Process -FilePath '$exePath' -WindowStyle Hidden$exeArgs"
+        -Argument "-NoProfile -WindowStyle Hidden -Command `"`$process = Start-Process -FilePath '$escapedExePath' -WindowStyle Hidden -ArgumentList '$exeArgs' -Wait -PassThru; exit `$process.ExitCode`""
 
     Write-Host "Using: auto_login.exe (via PowerShell Start-Process, fully hidden)" -ForegroundColor Green
 }
@@ -58,14 +72,7 @@ else {
     $action = New-ScheduledTaskAction `
         -Execute $pythonPath `
         -WorkingDirectory $scriptDir `
-        -Argument "$scriptDir\auto_login.py --background$pyArgs"
-}
-
-# Remove existing task if present
-$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-if ($existing) {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-    Write-Host "Removed existing task '$taskName'" -ForegroundColor Yellow
+        -Argument "`"$scriptDir\auto_login.py`" --background$pyArgs"
 }
 
 # Trigger
@@ -73,14 +80,14 @@ if ($Boot) {
     $trigger = New-ScheduledTaskTrigger -AtStartup
 }
 else {
-    $trigger = New-ScheduledTaskTrigger -Daily -At "19:45"
+    $trigger = New-ScheduledTaskTrigger -Daily -At $ScheduleTime
 }
 
 # Principal
 if ($Boot) {
     $principal = New-ScheduledTaskPrincipal `
         -UserId "SYSTEM" `
-        -LogonType S4U `
+        -LogonType ServiceAccount `
         -RunLevel Limited
 }
 else {
@@ -115,13 +122,50 @@ else {
 $settings.Hidden = $true
 
 # Register
-Register-ScheduledTask `
-    -TaskName $taskName `
-    -Action $action `
-    -Trigger $trigger `
-    -Principal $principal `
-    -Settings $settings `
-    -Force | Out-Null
+# NOTE: Register-ScheduledTask raises a CIM non-terminating error on access
+# denial, which $ErrorActionPreference = "Stop" does NOT trap — the script would
+# print a fake success banner. Catch it explicitly and verify the result.
+$registerError = $null
+try {
+    Register-ScheduledTask `
+        -TaskName $taskName `
+        -Action $action `
+        -Trigger $trigger `
+        -Principal $principal `
+        -Settings $settings `
+        -Force `
+        -ErrorAction Stop | Out-Null
+}
+catch {
+    $registerError = $_.Exception.Message
+}
+
+if ($registerError) {
+    Write-Host ""
+    Write-Host "ERROR: failed to register task '$taskName'." -ForegroundColor Red
+    Write-Host "  Reason: $registerError" -ForegroundColor Red
+    Write-Host "  Fix:    run this script from an ELEVATED PowerShell (Run as Administrator)." -ForegroundColor Yellow
+    exit 1
+}
+
+# Verify the task actually landed with the expected trigger
+$registered = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if (-not $registered) {
+    Write-Host "ERROR: task '$taskName' not found after registration." -ForegroundColor Red
+    exit 1
+}
+
+$actual = ($registered.Triggers | ForEach-Object { $_.StartBoundary }) -join ','
+if ($Boot) {
+    # AtStartup triggers carry no StartBoundary — assert the trigger kind instead
+    if (-not $registered.Triggers[0].CimClass.CimClassName.Contains('Startup')) {
+        Write-Host "WARNING: boot task trigger is not AtStartup ($actual)" -ForegroundColor Yellow
+    }
+}
+elseif ($actual -notmatch ('T' + [regex]::Escape($ScheduleTime) + ':00')) {
+    Write-Host "ERROR: task registered but trigger is '$actual', expected $ScheduleTime." -ForegroundColor Red
+    exit 1
+}
 
 Write-Host "Task '$taskName' registered successfully!" -ForegroundColor Green
 if ($Boot) {
@@ -130,7 +174,7 @@ if ($Boot) {
     Write-Host "  Auth modes: portal_post / http only (browser NOT compatible with Session 0)"
 }
 else {
-    Write-Host "  Schedule: Daily at 19:45"
+    Write-Host "  Schedule: Daily at $ScheduleTime"
     Write-Host "  Window:   Fully hidden (no popup)"
 }
 Write-Host "  Log file:  $scriptDir\logs\"
