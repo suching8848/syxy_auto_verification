@@ -1,6 +1,6 @@
 # Campus Network Auto-Login
 
-> **当前版本：v1.6** | 免费开源 | 仅供学习研究使用
+> **当前版本：v1.6.1** | 免费开源 | 仅供学习研究使用
 
 校园网断线自动认证工具。定时检测网络状态，检测到 captive portal 后通过后台 HTTP 请求静默完成认证，**完全无感**——不断网、不弹窗、不影响使用。
 
@@ -51,7 +51,7 @@ logs/                       # 运行日志（按日期，自动清理 7 天前�
 
 **方式 A：下载 exe（推荐，无需安装 Python）**
 
-从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.6.zip`，解压到任意文件夹。
+从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.6.1.zip`，解压到任意文件夹。
 
 **方式 B：运行 Python 脚本**
 
@@ -317,7 +317,7 @@ pip install pyinstaller
 pyinstaller --onefile --console --name auto_login auto_login.py
 ```
 
-分发给别人需要的文件（已打包在 `auto_login_v1.6.zip`）：
+分发给别人需要的文件（已打包在 `auto_login_v1.6.1.zip`）：
 
 ```
 auto_login.exe              # 主程序
@@ -343,6 +343,16 @@ Start-Process chrome -ArgumentList "--auto-open-devtools-for-tabs", "http://www.
 5. 如果字段名或路径与默认的不同，需要修改脚本 `do_auth_portal_post()` 中的 form_data
 
 ## 版本历史
+
+### v1.6.1 (2026-09-13)
+
+- **修复 portal 检测误判（重要）**：百度会把 `http://www.baidu.com` 301 到 `https://www.baidu.com/`，旧逻辑把这种正常的同站 HTTPS 升级当成 portal 劫持，导致网络正常时被判为断网；更严重的是认证后的 3 次联网复核也恒失败，**即使 portal 返回 success 也无法恢复到正常状态**
+- **认证参数统一**：移除 `portal_host` 兼容回退，配置键统一为 `portal_url`，消除 `http` 模式下 `portal_url` 为空的隐患
+- **断网诊断日志**：断网时额外记录对端是否 TCP 可达，用于区分"真离线"与"portal 透明代理"，便于排查
+- **`setup_task.ps1` 错误处理**：`Register-ScheduledTask` 在权限不足时抛的是 CIM 非终止错误，旧脚本会打印**假的成功横幅**；现改为明确报错并校验注册结果
+- **计划任务默认时间** 22:35 → 18:50
+- 新增离线回归测试（15 个，全部 mock 网络）
+- 已用真实断网演练验证：检测 → 认证 → 恢复闭环，单轮耗时 < 5 秒
 
 ### v1.6 (2026-05-16)
 
