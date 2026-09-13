@@ -23,5 +23,10 @@ build/*
 # 打包用的图标资源需要提交
 !assets/
 
-# 发布包组装用的素材（说明书等随 RELEASE_v*.md 一起维护，不必单独提交）
+# 发布包组装素材（说明书等随 RELEASE_v*.md 一起维护）
 packaging/
+# 但发布打包脚本必须入库：它负责只收白名单文件，防止把运行目录里
+# 用户自己的 auto_login_config.json（含明文密码）和 logs/ 打进 zip 上传
+!packaging/
+packaging/*
+!packaging/make_release_zip.py
