@@ -2839,6 +2839,20 @@ class GuiApp:
                 # _on_close_request 会把 ✕ 当作退出，不会把窗口藏进一个不存在的托盘。
                 self._tray = None
                 self._log("托盘不可用，已改为无托盘窗口模式（关闭窗口即退出）。", "warn")
+                # 关键补充：如果此刻窗口正缩在托盘里（✕ 隐藏过），它现在没有任何
+                # 办法被找回来 —— 托盘图标没了、任务栏上也没有，用户只能看到"程序
+                # 不见了，但进程还在"。托盘是恢复窗口的唯一入口，它一没，就必须把
+                # 窗口自己显示出来。
+                if self._window_hidden():
+                    self._show_window()
+                    self._log("已把窗口重新显示出来：托盘没了，请从窗口退出。", "warn")
+
+    def _window_hidden(self):
+        """窗口当前是否不可见（缩到托盘 = withdrawn，最小化 = iconic）。"""
+        try:
+            return self.root.state() != "normal"
+        except Exception:
+            return False
 
     def _queue_exit(self, reason):
         """可从任意线程调用 — 只入队。"""

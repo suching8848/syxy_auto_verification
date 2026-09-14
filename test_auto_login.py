@@ -776,8 +776,54 @@ class GuiLifecycleTests(unittest.TestCase):
         """托盘建不起来时不能顺手关掉程序，也不能偷偷开始守护。"""
         self.ui._tray = Mock()
         self.ui._do_exit = Mock()
+        self.ui.root = Mock()
+        self.ui.root.state.return_value = "normal"
         self.ui._handle_message("tray_exited", False)
         self.ui._do_exit.assert_not_called()
+        self.assertIsNone(self.ui._tray)
+
+    def test_tray_failure_restores_a_window_that_was_hidden(self):
+        """窗口已经缩到托盘、托盘又挂了：必须把窗口找回来。
+
+        回归守卫：只清 _tray 不动窗口，会让程序变成一个"界面上什么都没有、进程
+        还在跑"的幽灵 —— 托盘是缩起来的窗口唯一的入口，入口没了就得自己露面。
+        """
+        self.ui._tray = Mock()
+        self.ui._do_exit = Mock()
+        self.ui._show_window = Mock()
+        self.ui.root = Mock()
+        self.ui.root.state.return_value = "withdrawn"      # ✕ 隐藏过
+        self.ui._handle_message("tray_exited", False)
+        self.ui._show_window.assert_called_once()
+        self.ui._do_exit.assert_not_called()
+        self.assertIsNone(self.ui._tray)
+
+    def test_minimized_window_also_comes_back(self):
+        self.ui._tray = Mock()
+        self.ui._do_exit = Mock()
+        self.ui._show_window = Mock()
+        self.ui.root = Mock()
+        self.ui.root.state.return_value = "iconic"
+        self.ui._handle_message("tray_exited", False)
+        self.ui._show_window.assert_called_once()
+
+    def test_tray_failure_does_not_yank_a_visible_window(self):
+        """窗口本来就好好显示着，就别去抢焦点。"""
+        self.ui._tray = Mock()
+        self.ui._do_exit = Mock()
+        self.ui._show_window = Mock()
+        self.ui.root = Mock()
+        self.ui.root.state.return_value = "normal"
+        self.ui._handle_message("tray_exited", False)
+        self.ui._show_window.assert_not_called()
+
+    def test_window_state_failure_is_not_fatal(self):
+        """state() 抛异常时按"没隐藏"处理，别让恢复逻辑变成新的崩溃点。"""
+        self.ui._tray = Mock()
+        self.ui._do_exit = Mock()
+        self.ui.root = Mock()
+        self.ui.root.state.side_effect = RuntimeError("window already destroyed")
+        self.ui._handle_message("tray_exited", False)
         self.assertIsNone(self.ui._tray)
 
     def test_normal_tray_exit_still_closes_the_app(self):
@@ -858,7 +904,7 @@ class ReleaseManifestTests(unittest.TestCase):
         import runpy
         import zipfile
         root = os.path.dirname(os.path.abspath(__file__))
-        with patch.object(sys, "argv", ["make_release_zip.py", "1.7.4"]):
+        with patch.object(sys, "argv", ["make_release_zip.py", "1.7.5"]):
             module = runpy.run_path(os.path.join(root, "packaging", "make_release_zip.py"))
         with tempfile.TemporaryDirectory() as staging:
             for src, _ in module["MANIFEST"]:
@@ -876,7 +922,7 @@ class ReleaseManifestTests(unittest.TestCase):
             module["main"].__globals__["ROOT"] = staging
             with contextlib.redirect_stdout(io.StringIO()):
                 module["main"]()
-            with zipfile.ZipFile(os.path.join(staging, "dist", "auto_login_v1.7.4.zip")) as z:
+            with zipfile.ZipFile(os.path.join(staging, "dist", "auto_login_v1.7.5.zip")) as z:
                 names = z.namelist()
             self.assertTrue(any(n.endswith("使用说明.txt") for n in names))
             self.assertFalse(any(n.endswith("auto_login_config.json") for n in names))

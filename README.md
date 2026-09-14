@@ -1,6 +1,6 @@
 # Campus Network Auto-Login
 
-> **当前版本：v1.7.4** | 免费开源 | 仅供学习研究使用
+> **当前版本：v1.7.5** | 免费开源 | 仅供学习研究使用
 
 校园网断线自动认证工具。定时检测网络状态，检测到 captive portal 后通过后台 HTTP 请求静默完成认证，**完全无感**——不断网、不弹窗、不影响使用。
 
@@ -119,7 +119,7 @@ LICENSE                     # MIT 协议
 
 **方式 A：下载 exe（推荐，无需安装 Python）**
 
-从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.7.4.zip`，解压到任意文件夹（**注意整个文件夹一起解压，`assets` 子目录是图标，不能少**）。
+从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.7.5.zip`，解压到任意文件夹（**注意整个文件夹一起解压，`assets` 子目录是图标，不能少**）。
 
 > **放在哪最好？** 程序放桌面也能用，但下面三种位置会让「每天自动守护」部署失败或到点不执行，排查起来还特别费劲：
 >
@@ -411,7 +411,7 @@ pyinstaller --onefile --console --name auto_login --specpath build auto_login.py
 > **为什么必须用 spec 文件而不是一行命令？** `CampusNet.spec` 里写死了
 > `console=False` 和图标路径。官方文档见 `docs/GUI_PLAN.md`。
 
-分发给别人需要的文件（已打包在 `auto_login_v1.7.4.zip`）：
+分发给别人需要的文件（已打包在 `auto_login_v1.7.5.zip`）：
 
 ```
 CampusNet.exe                   # 图形版主程序（双击即用，也支持 --silent）
@@ -419,7 +419,7 @@ assets\campusnet.ico            # 托盘/程序图标，必须和 exe 一起
 使用说明.txt                     # 三句话说清怎么用
 setup_task.ps1                  # 计划任务部署脚本（含 -Silent 静默模式）
 auto_login_config.example.json  # 配置模板（程序也会自己生成）
-RELEASE_v1.7.4.md               # 本版 Release 说明
+RELEASE_v1.7.5.md               # 本版 Release 说明
 ```
 
 对方解压后双击 `CampusNet.exe`：同目录会自动生成 `auto_login_config.json` 和 `logs\`，在「设置」页填好学号密码即可。
@@ -443,6 +443,11 @@ Start-Process chrome -ArgumentList "--auto-open-devtools-for-tabs", "http://www.
 5. 如果字段名或路径与默认的不同，需要修改脚本 `do_auth_portal_post()` 中的 form_data
 
 ## 版本历史
+
+### v1.7.5 (2026-09-14)
+
+- 补齐 v1.7.4 的异常恢复：窗口已缩到托盘、托盘又失效时，把窗口自动显示回来（此前只清掉托盘引用，窗口会留在"看不见还在跑"的状态）。只对不可见的窗口动手；读取窗口状态失败不会导致异常退出。
+- 72 项离线测试通过。v1.7.4 附件不变。
 
 ### v1.7.4 (2026-09-14)
 
@@ -588,6 +593,6 @@ python -m unittest -v test_auto_login
 - 每日静默任务由 Windows 决定启动时刻，启动参数包含 `--now`，避免再按配置时间等待。修改时间后请重新部署任务；已有任务也需重新部署才能使用此修复。
 - 手动守护持续运行，直到点击停止或退出。停止过程中需等当前网络请求结束，才可再次启动；旧线程消息不会覆盖新一轮状态。
 - GUI 部署会检查注册是否成功，并核对保存的程序路径、参数、工作目录和触发时间。每日守护时长必须是正整数。
-- 构建 `CampusNet.exe` 后，运行 `python packaging/make_release_zip.py 1.7.4` 生成白名单发布包；说明文件随源码维护。源码修改不会自动更新已有 exe。
+- 构建 `CampusNet.exe` 后，运行 `python packaging/make_release_zip.py 1.7.5` 生成白名单发布包；说明文件随源码维护。源码修改不会自动更新已有 exe。
 
 本机目录及实际运行入口参见 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)。

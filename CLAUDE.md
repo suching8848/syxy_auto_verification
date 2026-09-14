@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Campus network auto-login tool (v1.7.4). Detects captive portal via HTTP content inspection and re-authenticates in the background. Runs as a Windows scheduled task or as a system tray app with notification area icon.
+Campus network auto-login tool (v1.7.5). Detects captive portal via HTTP content inspection and re-authenticates in the background. Runs as a Windows scheduled task or as a system tray app with notification area icon.
 
 Two user-facing scenarios drive the design, and both are the **same behaviour** (probe continuously, re-auth the moment the portal drops traffic) — they differ only in how they start and what shell they wear:
 
@@ -140,7 +140,7 @@ Uses ctypes to call Win32 APIs directly — zero external dependencies:
 - `Shell_NotifyIconW` (NIM_ADD/NIM_MODIFY/NIM_DELETE) — notification area icon
 - `CreatePopupMenu` + `TrackPopupMenu` — right-click context menu (status, show/hide console, exit)
 - `GetConsoleWindow` + `ShowWindow` — hide/restore terminal window
-- Spawns a daemon `threading.Thread` running `run_detection_loop` with `stop_event` and `status_callback` — **only when `start_worker=True`** (the default). The GUI passes `start_worker=False` because its guard belongs to `GuiApp.start_monitor()` / `stop_monitor()`: with both running there were two detection loops and 「停止守护」 could only stop the GUI's, leaving the tray's alive until `run_duration_minutes` expired (the interface said 待命中 while the machine was still probing and re-authenticating). Console tray modes (`--tray`, menu [5]) keep the default. **The init-failure branch respects the same flag**: with `start_worker=False` it starts nothing and returns `False`; with the default it still falls back to a console probe, now passing `stop_event` so the fallback can actually be stopped. `run()` returns whether the tray came up, and `GuiApp` uses that to tell "tray exited → close the app" from "tray never came up → keep running window-only" (`_tray = None`, so ✕ exits instead of hiding into a tray that does not exist).
+- Spawns a daemon `threading.Thread` running `run_detection_loop` with `stop_event` and `status_callback` — **only when `start_worker=True`** (the default). The GUI passes `start_worker=False` because its guard belongs to `GuiApp.start_monitor()` / `stop_monitor()`: with both running there were two detection loops and 「停止守护」 could only stop the GUI's, leaving the tray's alive until `run_duration_minutes` expired (the interface said 待命中 while the machine was still probing and re-authenticating). Console tray modes (`--tray`, menu [5]) keep the default. **The init-failure branch respects the same flag**: with `start_worker=False` it starts nothing and returns `False`; with the default it still falls back to a console probe, now passing `stop_event` so the fallback can actually be stopped. `run()` returns whether the tray came up, and `GuiApp` uses that to tell "tray exited → close the app" from "tray never came up → keep running window-only" (`_tray = None`). That fallback must also **restore a hidden window** (`_window_hidden()` → `_show_window()`): once the tray is gone there is no second way back to a window that was withdrawn with ✕, and the process would keep running with nothing on screen.
 - `status_callback` posts `WM_USER_TRAY_UPDATE` to the main thread for tooltip updates
 - `stop_event` enables clean shutdown: right-click Exit → `stop_event.set()` → `DestroyWindow` → `PostQuitMessage`
 
@@ -284,6 +284,7 @@ The background mode check (`if not INTERACTIVE or args.background:`) MUST execut
 - GUI: `_tick` checks an `_alive` flag and stops rescheduling once `_do_exit` tears the window down. A pending `after()` callback firing on a destroyed canvas raises `TclError: invalid command name` and spams tracebacks during shutdown.
 - Scenario A verified end to end (all 8 checks): tray icon created → window `normal` → ✕ withdraws it → reopen restores `normal` → quit wakes the tray thread and exits cleanly. The guard exists only after 「开始守护」 (v1.7.4 removed the tray's own auto-started worker, which had been running a second loop behind the interface's back).
 - v1.7.4: `TrayApp(start_worker=False)` for the GUI (one loop, and stopping really stops); `elevation_outcome()` judges UAC cancellation from `GetLastError()` after checking `rc <= 32`.
+- GUI tray loss is survivable end to end: init failure keeps the app open in window-only mode without starting any probe, and a tray that dies while the window is hidden brings the window back (`MainWindowHandle` goes 0 → visible in a runtime probe). Verified by forcing `GUITray._create_tray_icon` to raise, and by a fake `GUITray.run()` that withdraws the window then returns `False`.
 
 - Scheduled launches pass `--now`: the task trigger owns the start time; the process does not wait again for `silent_start_time`. GUI registration stops on errors and verifies the saved action and trigger before reporting success.
 - Release instructions `packaging/使用说明.txt` are included in version control alongside the release manifest.
