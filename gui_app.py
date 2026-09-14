@@ -2612,7 +2612,7 @@ class GuiApp:
 
     # ── 守护循环（场景 A 的核心，与场景 B 同一套行为）──────────────────
     def start_monitor(self):
-        if self._monitor and self._monitor.is_alive():
+        if self._monitor is not None:
             return
         if core._need_setup(self._config):
             self._log("账号密码还没填，已经帮你切到「设置」页，填好保存再回来点开始。", "error")
@@ -2627,28 +2627,30 @@ class GuiApp:
         self._outage_start = None
         self._set_state(STATE_PENDING)
         self._log("开始守护：将持续探测网络，一旦断网立刻自动重连。", "ok")
-        self._monitor = threading.Thread(target=self._monitor_loop, daemon=True)
+        self._monitor = threading.Thread(
+            target=self._monitor_loop,
+            args=(dict(self._config), self._monitor_stop), daemon=True)
         self._monitor.start()
 
     def stop_monitor(self):
         if self._monitor_stop:
             self._monitor_stop.set()
-        self._monitor = None          # 立刻反映到界面，不等线程真正退出
         self._log("正在停止守护…", "dim")
-        self._set_state(STATE_IDLE)
 
-    def _monitor_loop(self):
+    def _monitor_loop(self, config, stop_event):
         """后台线程：只入队，不碰界面。"""
         try:
             core.run_detection_loop(
-                self._config,
-                stop_event=self._monitor_stop,
-                status_callback=StatusSink(self._q),
+                config,
+                stop_event=stop_event,
+                status_callback=lambda status: self._q.put(
+                    ("monitor_status", (stop_event, status))),
+                duration_override=0,
             )
         except Exception as e:
             core.log(f"Monitor loop crashed: {e}", "ERROR")
         finally:
-            self._q.put(("monitor_done", None))
+            self._q.put(("monitor_done", stop_event))
 
     def auth_now(self):
         """用户主动点「立即认证」— 只做一次，不影响守护循环。"""
@@ -2720,6 +2722,10 @@ class GuiApp:
                     self._append_text(human, self._tag_for(level))
         elif kind == "status":
             self._on_status_line(payload)
+        elif kind == "monitor_status":
+            event, status = payload
+            if event is self._monitor_stop and not event.is_set():
+                self._on_status_line(status)
         elif kind == "auth_done":
             ok, cost, detail, was_ok_already = payload
             if ok:
@@ -2732,6 +2738,10 @@ class GuiApp:
             else:
                 self._set_state(STATE_FAILED)
         elif kind == "monitor_done":
+            if payload is not self._monitor_stop:
+                return
+            self._monitor = None
+            self._monitor_stop = None
             if self._state != STATE_EXITING:
                 self._set_state(STATE_IDLE)
                 self._log("守护已停止。", "dim")
@@ -3102,6 +3112,9 @@ class GuiApp:
         if new.get("silent_start_time") and not core._parse_hhmm(new["silent_start_time"]):
             messagebox.showerror("填错了", "每天启动时刻要写成 HH:MM，例如 23:00。")
             return None
+        if new["silent_run_minutes"] <= 0:
+            messagebox.showerror("填错了", "每日守护时长必须大于 0 分钟。")
+            return None
         target = core.config_write_path()
         if not core.save_config(new, path=target):
             messagebox.showerror("保存失败", f"写不进配置：\n{target}\n请检查目录权限。")
@@ -3304,20 +3317,31 @@ class GuiApp:
         # Running from source means sys.executable is python.exe, which needs the
         # script path as well — otherwise the task would launch a bare
         # interpreter and die instantly. The frozen exe is self-contained.
-        args = f"--silent --run-minutes {int(run_min)}"
+        args = f"--silent --now --run-minutes {int(run_min)}"
         if not getattr(sys, "frozen", False):
             args = f'"{os.path.abspath(__file__)}" {args}'
+        quote = lambda value: "'" + str(value).replace("'", "''") + "'"
         inner = (
+            "$ErrorActionPreference = 'Stop'; "
+            f"$expectedExe = {quote(sys.executable)}; "
+            f"$expectedArgs = {quote(args)}; "
+            f"$expectedDir = {quote(core.exe_dir())}; "
             f"Register-ScheduledTask -TaskName '{SILENT_TASK_NAME}' "
-            f"-Action (New-ScheduledTaskAction -Execute '{sys.executable}' "
-            f"-Argument '{args}' "
-            f"-WorkingDirectory '{core.exe_dir()}') "
+            "-Action (New-ScheduledTaskAction -Execute $expectedExe "
+            "-Argument $expectedArgs -WorkingDirectory $expectedDir) "
             f"-Trigger (New-ScheduledTaskTrigger -Daily -At {start_at}) "
             f"-Settings (New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries "
             f"-DontStopIfGoingOnBatteries -StartWhenAvailable "
             f"-MultipleInstances IgnoreNew "
             f"-ExecutionTimeLimit (New-TimeSpan -Minutes {limit}) "
-            f"-RestartCount 0) -Force | Out-Null; exit 0"
+            f"-RestartCount 0) -Force -ErrorAction Stop | Out-Null; "
+            f"$task = Get-ScheduledTask -TaskName '{SILENT_TASK_NAME}' -ErrorAction Stop; "
+            "if ($task.Actions.Count -ne 1 -or $task.Triggers.Count -ne 1 -or "
+            "$task.Actions[0].Execute -ne $expectedExe -or "
+            "$task.Actions[0].Arguments -ne $expectedArgs -or "
+            "$task.Actions[0].WorkingDirectory -ne $expectedDir -or "
+            f"([datetime]$task.Triggers[0].StartBoundary).ToString('HH:mm') -ne '{start_at}') "
+            "{ throw 'Registered task does not match requested settings' }; exit 0"
         )
         encoded = base64.b64encode(inner.encode("utf-16-le")).decode("ascii")
         return ("powershell -NoProfile -ExecutionPolicy Bypass "
@@ -3383,7 +3407,11 @@ class GuiApp:
         if not self._require_credentials():
             self.mode_note.configure(text="配置不完整，任务没有创建。", fg="#cc2b2b")
             return
-        start_at = self._config["silent_start_time"]
+        parsed_time = core._parse_hhmm(self._config["silent_start_time"])
+        if parsed_time is None:
+            messagebox.showerror("填错了", "请填写每天启动时刻，例如 23:00。")
+            return
+        start_at = parsed_time.strftime("%H:%M")
         run_min = self._config["silent_run_minutes"]
         if not self._explain_elevation():
             self.mode_note.configure(text="已取消，没有做任何改动。", fg="#6b7280")
@@ -3402,7 +3430,7 @@ class GuiApp:
                 "你在系统权限窗口点了「否」，所以任务没有创建。", ran_cmd, output)
             return
 
-        if self._task_exists():
+        if rc == 0 and self._task_exists():
             self.mode_note.configure(
                 text=f"已创建每日任务 ✓　每天 {start_at} 静默守护 {run_min} 分钟，"
                      f"全程无窗口、无托盘、无提示，只在日志里留记录。", fg="#1a9c4a")

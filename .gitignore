@@ -30,3 +30,4 @@ packaging/
 !packaging/
 packaging/*
 !packaging/make_release_zip.py
+!packaging/使用说明.txt

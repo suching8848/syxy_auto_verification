@@ -59,7 +59,7 @@ if ($Silent) {
     $action = New-ScheduledTaskAction `
         -Execute $guiExePath `
         -WorkingDirectory $scriptDir `
-        -Argument "--silent --run-minutes $RunMinutes"
+        -Argument "--silent --now --run-minutes $RunMinutes"
 
     Write-Host "Using: CampusNet.exe --silent (no window, no tray icon)" -ForegroundColor Green
 }

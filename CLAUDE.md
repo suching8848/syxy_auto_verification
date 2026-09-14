@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Campus network auto-login tool (v1.7.0). Detects captive portal via HTTP content inspection and re-authenticates in the background. Runs as a Windows scheduled task or as a system tray app with notification area icon.
+Campus network auto-login tool (v1.7.1). Detects captive portal via HTTP content inspection and re-authenticates in the background. Runs as a Windows scheduled task or as a system tray app with notification area icon.
 
 Two user-facing scenarios drive the design, and both are the **same behaviour** (probe continuously, re-auth the moment the portal drops traffic) — they differ only in how they start and what shell they wear:
 
@@ -221,7 +221,7 @@ GUI/silent additions to `DEFAULT_CONFIG`:
 
 - **Daily mode** (no flags): creates `CampusNetAutoLogin` task using config `schedule_time` (default 20:30), overridable with `-ScheduleTime HH:mm`
 - **Boot mode** (`-Boot`): creates `CampusNetAutoLogin_Boot` task with `-AtStartup` trigger
-- **Silent mode** (`-Silent`): creates `CampusNetAutoLogin_Silent`, a daily trigger at `$SilentAt` (falls back to config `silent_start_time`), running `CampusNet.exe --silent --run-minutes N` **directly** — no `Start-Process` wrapper is needed because a `--windowed` exe creates no console. `ExecutionTimeLimit` is `$RunMinutes + 10` minutes rather than the 2-hour default. Fails loudly if `CampusNet.exe` is missing, since `auto_login.exe` cannot do silent mode cleanly.
+- **Silent mode** (`-Silent`): creates `CampusNetAutoLogin_Silent`, a daily trigger at `$SilentAt` (falls back to config `silent_start_time`), running `CampusNet.exe --silent --now --run-minutes N` **directly** — no `Start-Process` wrapper is needed because a `--windowed` exe creates no console. `ExecutionTimeLimit` is `$RunMinutes + 10` minutes rather than the 2-hour default. Fails loudly if `CampusNet.exe` is missing, since `auto_login.exe` cannot do silent mode cleanly.
 - Prefers `auto_login.exe` if present → launches via `powershell.exe Start-Process -WindowStyle Hidden` (fully hidden); boot mode appends `--boot` argument
 - Falls back to `pythonw.exe` (no console window), then `python.exe`; searches PATH first, then common Python install locations
 - Daily task: `LogonType Interactive` (required for browser mode + `keybd_event`), `RunLevel Limited`, 2-hour execution time limit, `RestartCount 0`
@@ -269,9 +269,12 @@ The background mode check (`if not INTERACTIVE or args.background:`) MUST execut
 - EXE scheduled launcher passes --background/--boot, waits for completion, and propagates exit status; Python script paths are quoted.
 - Explicit CLI modes do not wait for Enter on exit.
 - Run offline tests before packaging; existing dist artifacts are not updated by source edits.
-- GUI: `run_detection_loop` runs on its own thread while the window polls a queue; `stop_monitor()` clears the thread reference immediately so the button state flips without waiting for the thread to unwind.
+- GUI: `run_detection_loop` runs on its own thread while the window polls a queue; `stop_monitor()` signals the existing worker and retains its reference until its completion message is consumed. Each worker captures its own config and stop event; stale status/completion messages are ignored. Manual guarding forces duration 0.
 - GUI: `close_to_tray` is honoured only when a tray icon actually exists; otherwise ✕ exits, so a tray-less environment can't leave an invisible, unstoppable process.
 - Silent mode verified end to end on Windows: `CampusNet.exe --silent --now --run-minutes 1` exits with code 0 after ~62s with **no window handle at any point** and only log output.
 - `--silent` never constructs `tkinter.Tk()`, so it is safe in Session 0 and under Task Scheduler.
 - GUI: `_tick` checks an `_alive` flag and stops rescheduling once `_do_exit` tears the window down. A pending `after()` callback firing on a destroyed canvas raises `TclError: invalid command name` and spams tracebacks during shutdown.
 - Scenario A verified end to end (all 8 checks): tray icon created → window `normal` → ✕ withdraws it while the probe thread keeps guarding → reopen restores `normal` → quit wakes the tray thread and exits cleanly.
+
+- Scheduled launches pass `--now`: the task trigger owns the start time; the process does not wait again for `silent_start_time`. GUI registration stops on errors and verifies the saved action and trigger before reporting success.
+- Release instructions `packaging/使用说明.txt` are included in version control alongside the release manifest.

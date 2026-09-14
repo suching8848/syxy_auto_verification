@@ -356,6 +356,158 @@ class GuiLogicTests(unittest.TestCase):
                 self.assertIn(state, gui_app.STATE_COLOR)
 
 
+class GuiLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        import gui_app
+        import queue
+        self.gui = gui_app
+        self.ui = gui_app.GuiApp.__new__(gui_app.GuiApp)
+        self.ui._config = dict(app.DEFAULT_CONFIG, username="student", password="test")
+        self.ui._q = queue.Queue()
+        self.ui._monitor = None
+        self.ui._monitor_stop = None
+        self.ui._state = gui_app.STATE_IDLE
+        self.ui._set_state = Mock()
+        self.ui._log = Mock()
+        self.ui._on_status_line = Mock()
+
+    def test_stop_blocks_restart_until_completion_is_consumed(self):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_probe(config, **kwargs):
+            entered.set()
+            release.wait(5)
+
+        with patch.object(app, "run_detection_loop", side_effect=blocked_probe) as run:
+            self.ui.start_monitor()
+            worker = self.ui._monitor
+            try:
+                self.assertTrue(entered.wait(2))
+                self.ui.stop_monitor()
+                self.ui.start_monitor()
+                self.assertIs(self.ui._monitor, worker)
+                self.assertEqual(run.call_count, 1)
+            finally:
+                release.set()
+                worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.ui.start_monitor()
+            self.assertIs(self.ui._monitor, worker)
+            self.ui._handle_message(*self.ui._q.get_nowait())
+            self.assertIsNone(self.ui._monitor)
+            self.ui.start_monitor()
+            self.ui._monitor.join(2)
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(run.call_args.kwargs["duration_override"], 0)
+
+    def test_stale_worker_messages_cannot_change_current_session(self):
+        old = threading.Event()
+        current = threading.Event()
+        self.ui._monitor_stop = current
+        worker = self.ui._monitor = Mock()
+        self.ui._handle_message("monitor_done", old)
+        self.ui._handle_message("monitor_status", (old, "old status"))
+        self.assertIs(self.ui._monitor, worker)
+        self.ui._set_state.assert_not_called()
+        self.ui._on_status_line.assert_not_called()
+        current.set()
+        self.ui._handle_message("monitor_status", (current, "stopping"))
+        self.ui._on_status_line.assert_not_called()
+
+    def test_failed_task_update_does_not_accept_existing_task(self):
+        self.ui.mode_var = Mock()
+        self.ui.mode_var.get.return_value = "silent"
+        self.ui._config.update(silent_start_time="23:00", silent_run_minutes=30)
+        for name in ("_write_config", "_require_credentials", "_explain_elevation",
+                     "_task_exists"):
+            setattr(self.ui, name, Mock(return_value=True))
+        self.ui._task_register_command = Mock(return_value="command")
+        self.ui._run_elevated = Mock(return_value=(1, "command", "failed"))
+        self.ui.mode_note = Mock()
+        self.ui.root = Mock()
+        self.ui._report_task_failure = Mock()
+        with patch.object(self.gui.messagebox, "showinfo") as success:
+            self.ui._deploy_silent_task()
+        success.assert_not_called()
+        self.ui._report_task_failure.assert_called_once()
+
+    def test_task_command_quotes_paths_and_checks_registered_settings(self):
+        import base64
+        with patch.object(sys, "executable", "C:\\O'Brien\\CampusNet.exe"), \
+             patch.object(sys, "frozen", True, create=True), \
+             patch.object(app, "exe_dir", return_value="C:\\O'Brien"):
+            command = self.ui._task_register_command("23:00", 30)
+        script = base64.b64decode(command.split()[-1]).decode("utf-16-le")
+        self.assertIn("O''Brien", script)
+        self.assertIn("--silent --now --run-minutes 30", script)
+        self.assertIn("-Force -ErrorAction Stop", script)
+        self.assertIn("$task.Actions[0].Arguments -ne $expectedArgs", script)
+        self.assertIn(".ToString('HH:mm') -ne '23:00'", script)
+
+    def test_generated_registration_verification_in_powershell(self):
+        import base64
+        import subprocess
+        command = self.ui._task_register_command("23:00", 30)
+        script = base64.b64decode(command.split()[-1]).decode("utf-16-le")
+        # Replace all task cmdlets: this never reads or writes actual tasks.
+        stubs = """
+function New-ScheduledTaskAction { param($Execute, $Argument, $WorkingDirectory) }
+function New-ScheduledTaskTrigger { param([switch]$Daily, $At) }
+function New-ScheduledTaskSettingsSet {
+ param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries,
+ [switch]$StartWhenAvailable, $MultipleInstances, $ExecutionTimeLimit, $RestartCount)
+}
+function Register-ScheduledTask { param($TaskName, $Action, $Trigger, $Settings,
+ [switch]$Force, $ErrorAction) }
+function Get-ScheduledTask {
+ param($TaskName, $ErrorAction)
+ [pscustomobject]@{ Actions = @([pscustomobject]@{
+ Execute = $expectedExe; Arguments = $expectedArgs; WorkingDirectory = $expectedDir
+ }); Triggers = @([pscustomobject]@{ StartBoundary = '2026-01-01T23:00:00' }) }
+}
+"""
+        for matches in (True, False):
+            with self.subTest(matches=matches):
+                body = stubs if matches else stubs.replace("23:00:00", "22:00:00")
+                encoded = base64.b64encode((body + script).encode("utf-16-le")).decode()
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-EncodedCommand", encoded],
+                    capture_output=True, timeout=20, creationflags=0x08000000)
+                self.assertEqual(result.returncode == 0, matches, result.stderr)
+
+
+class ReleaseManifestTests(unittest.TestCase):
+    def test_release_includes_tracked_instructions_and_excludes_credentials(self):
+        import contextlib
+        import io
+        import runpy
+        import zipfile
+        root = os.path.dirname(os.path.abspath(__file__))
+        with patch.object(sys, "argv", ["make_release_zip.py", "1.7.1"]):
+            module = runpy.run_path(os.path.join(root, "packaging", "make_release_zip.py"))
+        with tempfile.TemporaryDirectory() as staging:
+            for src, _ in module["MANIFEST"]:
+                path = os.path.join(staging, src)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                if src.endswith(".exe"):
+                    data = b"test fixture, not an executable"
+                else:
+                    with open(os.path.join(root, src), "rb") as source:
+                        data = source.read()
+                with open(path, "wb") as target:
+                    target.write(data)
+            with open(os.path.join(staging, "dist", "auto_login_config.json"), "w") as f:
+                f.write('test private data')
+            module["main"].__globals__["ROOT"] = staging
+            with contextlib.redirect_stdout(io.StringIO()):
+                module["main"]()
+            with zipfile.ZipFile(os.path.join(staging, "dist", "auto_login_v1.7.1.zip")) as z:
+                names = z.namelist()
+            self.assertTrue(any(n.endswith("使用说明.txt") for n in names))
+            self.assertFalse(any(n.endswith("auto_login_config.json") for n in names))
+
+
 class PowerShellScriptTests(unittest.TestCase):
     """setup_task.ps1 must stay loadable by Windows PowerShell 5.1.
 
