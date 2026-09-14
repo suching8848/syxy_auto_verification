@@ -3061,7 +3061,10 @@ class GuiApp:
 
     # ── 界面动作 ─────────────────────────────────────────────────────────
     def _on_primary_click(self):
-        if self._monitor and self._monitor.is_alive():
+        # 必须和 start_monitor 用同一个判断。这里若用 is_alive()，会出现
+        # "worker 线程已结束但其完成消息还没被处理"的窗口：按钮显示可点，
+        # 点下去却在 start_monitor 里被 _monitor is not None 拒绝，用户以为坏了。
+        if self._monitor is not None:
             self.stop_monitor()
         else:
             self.start_monitor()
@@ -3127,7 +3130,7 @@ class GuiApp:
         if not target:
             return
         self._refresh_labels()          # 刚填好账号，按钮要立刻从灰变可点
-        if self._monitor and self._monitor.is_alive():
+        if self._monitor is not None:
             self._log("设置已保存。守护中改的账号密码，下次启动守护时生效。", "ok")
         elif self._missing_credentials():
             self._log("设置已保存，但账号密码还没填完整。", "warn")
@@ -3502,7 +3505,11 @@ class GuiApp:
         # 这里只是让用户一眼看出"还没配好"，而不是点了才发现。
         missing = self._missing_credentials()
 
-        running = bool(self._monitor and self._monitor.is_alive())
+        # "有没有守护会话"统一用 _monitor is not None 判断 —— 它与
+        # start_monitor 的守卫、_on_primary_click 的分支保持一致。用
+        # is_alive() 会在"线程已结束、完成消息未处理"时把按钮显示成可点，
+        # 但点下去会被守卫拒绝（见 _on_primary_click 的说明）。
+        running = self._monitor is not None
         # 主按钮
         if running:
             self.primary_btn.configure(text="■  停止守护", bg="#b8730a",

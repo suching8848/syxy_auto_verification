@@ -371,6 +371,25 @@ class GuiLifecycleTests(unittest.TestCase):
         self.ui._log = Mock()
         self.ui._on_status_line = Mock()
 
+    def test_primary_click_agrees_with_start_monitor_guard(self):
+        """点击处理必须和 start_monitor 用同一个判断（_monitor is not None）。
+
+        回归守卫：这里如果用 _monitor.is_alive()，一旦 worker 线程已经结束、
+        而它的完成消息还躺在队列里没被处理，两者就会给出相反答案 ——
+        按钮显示可再启动，点下去却在 start_monitor 的守卫里被静默拒绝，
+        用户以为程序坏了。
+        """
+        dead = Mock()
+        dead.is_alive.return_value = False          # 线程已结束
+        self.ui._monitor = dead                     # 但完成消息尚未消费
+        self.ui.stop_monitor = Mock()
+        self.ui.start_monitor = Mock()
+
+        self.ui._on_primary_click()
+
+        self.ui.stop_monitor.assert_called_once()
+        self.ui.start_monitor.assert_not_called()
+
     def test_stop_blocks_restart_until_completion_is_consumed(self):
         entered = threading.Event()
         release = threading.Event()
