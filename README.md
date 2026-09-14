@@ -1,6 +1,6 @@
 # Campus Network Auto-Login
 
-> **当前版本：v1.7.1** | 免费开源 | 仅供学习研究使用
+> **当前版本：v1.7.2** | 免费开源 | 仅供学习研究使用
 
 校园网断线自动认证工具。定时检测网络状态，检测到 captive portal 后通过后台 HTTP 请求静默完成认证，**完全无感**——不断网、不弹窗、不影响使用。
 
@@ -119,7 +119,7 @@ LICENSE                     # MIT 协议
 
 **方式 A：下载 exe（推荐，无需安装 Python）**
 
-从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.7.1.zip`，解压到任意文件夹（**注意整个文件夹一起解压，`assets` 子目录是图标，不能少**）。
+从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.7.2.zip`，解压到任意文件夹（**注意整个文件夹一起解压，`assets` 子目录是图标，不能少**）。
 
 **方式 B：运行 Python 脚本**
 
@@ -143,7 +143,7 @@ cd syxy_auto_verification
     "request_timeout": 5,
     "auth_method": "portal_post",
     "run_duration_minutes": 60,
-    "auth_cooldown_seconds": 30,
+    "auth_cooldown_seconds": 3,
     "check_expected_body": "baidu",
     "portal_url": "http://10.10.200.102",
     "username": "你的学号",
@@ -316,7 +316,8 @@ Unregister-ScheduledTask -TaskName CampusNetAutoLogin -Confirm:$false
 | `fail_threshold` | `2` | 连续失败多少次后触发认证 |
 | `request_timeout` | `5` | HTTP 请求超时（秒） |
 | `run_duration_minutes` | `60` | 运行多久自动退出（分钟），`0` 为无限 |
-| `auth_cooldown_seconds` | `30` | 认证重试基础间隔；连续失败按 30、60、120…秒退避，默认上限 300 秒 |
+| `auth_cooldown_seconds` | `3` | 认证重试基础间隔；连续失败按 3、5、10、20、40…秒退避，默认上限 300 秒 |
+| `auth_retry_backoff_seconds` | `5` | 第二次失败后的等待基数，后续翻倍；实际请求时间还受检测轮询和网络请求耗时影响 |
 
 **portal_post 模式字段：**
 
@@ -402,7 +403,7 @@ pyinstaller --onefile --console --name auto_login --specpath build auto_login.py
 > **为什么必须用 spec 文件而不是一行命令？** `CampusNet.spec` 里写死了
 > `console=False` 和图标路径。官方文档见 `docs/GUI_PLAN.md`。
 
-分发给别人需要的文件（已打包在 `auto_login_v1.7.1.zip`）：
+分发给别人需要的文件（已打包在 `auto_login_v1.7.2.zip`）：
 
 ```
 CampusNet.exe                   # 图形版主程序（双击即用，也支持 --silent）
@@ -410,7 +411,7 @@ assets\campusnet.ico            # 托盘/程序图标，必须和 exe 一起
 使用说明.txt                     # 三句话说清怎么用
 setup_task.ps1                  # 计划任务部署脚本（含 -Silent 静默模式）
 auto_login_config.example.json  # 配置模板（程序也会自己生成）
-RELEASE_v1.7.1.md               # 本版 Release 说明
+RELEASE_v1.7.2.md               # 本版 Release 说明
 ```
 
 对方解压后双击 `CampusNet.exe`：同目录会自动生成 `auto_login_config.json` 和 `logs\`，在「设置」页填好学号密码即可。
@@ -434,6 +435,13 @@ Start-Process chrome -ArgumentList "--auto-open-devtools-for-tabs", "http://www.
 5. 如果字段名或路径与默认的不同，需要修改脚本 `do_auth_portal_post()` 中的 form_data
 
 ## 版本历史
+
+### v1.7.2 (2026-09-14)
+
+- 认证失败等待改为 3、5、10、20、40…秒，默认最长 300 秒。
+- 新增 `auth_retry_backoff_seconds`（默认 5），用于后续失败的递增基数。
+- 包含守护按钮与线程会话状态一致性修复，41 项离线测试通过。
+- 升级保留旧配置；若旧配置仍为 30 秒，请将 `auth_cooldown_seconds` 改为 3、`auth_retry_backoff_seconds` 设为 5，然后重启守护。
 
 ### v1.7.1 (2026-09-14)
 
@@ -558,4 +566,6 @@ python -m unittest -v test_auto_login
 - 每日静默任务由 Windows 决定启动时刻，启动参数包含 `--now`，避免再按配置时间等待。修改时间后请重新部署任务；已有任务也需重新部署才能使用此修复。
 - 手动守护持续运行，直到点击停止或退出。停止过程中需等当前网络请求结束，才可再次启动；旧线程消息不会覆盖新一轮状态。
 - GUI 部署会检查注册是否成功，并核对保存的程序路径、参数、工作目录和触发时间。每日守护时长必须是正整数。
-- 构建 `CampusNet.exe` 后，运行 `python packaging/make_release_zip.py 1.7.1` 生成白名单发布包；说明文件随源码维护。源码修改不会自动更新已有 exe。
+- 构建 `CampusNet.exe` 后，运行 `python packaging/make_release_zip.py 1.7.2` 生成白名单发布包；说明文件随源码维护。源码修改不会自动更新已有 exe。
+
+本机目录及实际运行入口参见 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)。

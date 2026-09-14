@@ -19,7 +19,7 @@ if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "v1.7.1"
+VERSION = "v1.7.2"
 
 # Required on Windows 11 for tray icon to appear — set before any window creation
 try:
@@ -93,7 +93,8 @@ DEFAULT_CONFIG = {
     "auth_method": "portal_post",
     "run_duration_minutes": 60,
     "browser_wait_seconds": 3,
-    "auth_cooldown_seconds": 30,
+    "auth_cooldown_seconds": 3,
+    "auth_retry_backoff_seconds": 5,
     "check_expected_body": "baidu",
     # portal_post mode fields (POST credentials to portal)
     "username": "",
@@ -608,7 +609,7 @@ def do_auth_browser(url, wait_seconds):
 
 def do_auth(config, last_auth_time):
     now = datetime.now()
-    cooldown = config.get("auth_cooldown_seconds", 30)
+    cooldown = config.get("auth_cooldown_seconds", 3)
     if last_auth_time and (now - last_auth_time).total_seconds() < cooldown:
         remaining = cooldown - int((now - last_auth_time).total_seconds())
         log(f"Auth cooldown ({remaining}s remaining), skip", "INFO")
@@ -1124,6 +1125,15 @@ def log_failure_context(url, detail):
         log(f"Detail: {detail} — remote host unreachable (genuine outage or DNS failure)", "WARN")
 
 
+def auth_retry_delay(config, failures):
+    """First retry is quick; subsequent failures back off from a separate base."""
+    first = max(1, config.get("auth_cooldown_seconds", 3))
+    base = max(first, config.get("auth_retry_backoff_seconds", 5))
+    if failures <= 1:
+        return first
+    return min(max(300, base), base * 2 ** min(failures - 2, 10))
+
+
 def run_detection_loop(config, stop_event=None, status_callback=None,
                        duration_override=None):
     """Core detection loop — runs until stopped or duration exceeded.
@@ -1210,8 +1220,7 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
                         auth_attempts += 1
                         authenticated = do_auth(config, None)
                         auth_failures = 0 if authenticated else auth_failures + 1
-                        cooldown = max(1, config.get("auth_cooldown_seconds", 30))
-                        delay = min(max(300, cooldown), cooldown * 2 ** min(max(0, auth_failures - 1), 10))
+                        delay = auth_retry_delay(config, auth_failures)
                         next_auth_at = time.monotonic() + delay
                     fail_count = 0
                 else:

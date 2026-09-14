@@ -31,3 +31,6 @@ packaging/
 packaging/*
 !packaging/make_release_zip.py
 !packaging/使用说明.txt
+
+# Local active deployment: credentials and logs
+runtime/

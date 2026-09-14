@@ -148,9 +148,17 @@ class AutoLoginTests(unittest.TestCase):
              patch.object(app.time, "sleep", side_effect=sleep):
             app.run_detection_loop(self.config, stop_event=stop)
         self.assertEqual(attempts[0], 2)
-        self.assertEqual(len(attempts), 3)
-        self.assertGreaterEqual(attempts[1] - attempts[0], 30)
-        self.assertGreaterEqual(attempts[2] - attempts[1], 60)
+        self.assertEqual(len(attempts), 6)
+        for index, delay in enumerate((3, 5, 10, 20, 40), start=1):
+            elapsed = attempts[index] - attempts[index - 1]
+            self.assertGreaterEqual(elapsed, delay)
+            self.assertLess(elapsed, delay + 4)
+
+    def test_retry_delay_progression_and_cap(self):
+        self.assertEqual([app.auth_retry_delay(self.config, n) for n in range(1, 10)],
+                         [3, 5, 10, 20, 40, 80, 160, 300, 300])
+        self.assertEqual(app.auth_retry_delay(self.config, 0), 3)
+        self.assertEqual(app.auth_retry_delay(dict(self.config, auth_cooldown_seconds=30), 2), 30)
 
 
 class SilentModeTests(unittest.TestCase):
@@ -503,7 +511,7 @@ class ReleaseManifestTests(unittest.TestCase):
         import runpy
         import zipfile
         root = os.path.dirname(os.path.abspath(__file__))
-        with patch.object(sys, "argv", ["make_release_zip.py", "1.7.1"]):
+        with patch.object(sys, "argv", ["make_release_zip.py", "1.7.2"]):
             module = runpy.run_path(os.path.join(root, "packaging", "make_release_zip.py"))
         with tempfile.TemporaryDirectory() as staging:
             for src, _ in module["MANIFEST"]:
@@ -521,7 +529,7 @@ class ReleaseManifestTests(unittest.TestCase):
             module["main"].__globals__["ROOT"] = staging
             with contextlib.redirect_stdout(io.StringIO()):
                 module["main"]()
-            with zipfile.ZipFile(os.path.join(staging, "dist", "auto_login_v1.7.1.zip")) as z:
+            with zipfile.ZipFile(os.path.join(staging, "dist", "auto_login_v1.7.2.zip")) as z:
                 names = z.namelist()
             self.assertTrue(any(n.endswith("使用说明.txt") for n in names))
             self.assertFalse(any(n.endswith("auto_login_config.json") for n in names))

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Campus network auto-login tool (v1.7.1). Detects captive portal via HTTP content inspection and re-authenticates in the background. Runs as a Windows scheduled task or as a system tray app with notification area icon.
+Campus network auto-login tool (v1.7.2). Detects captive portal via HTTP content inspection and re-authenticates in the background. Runs as a Windows scheduled task or as a system tray app with notification area icon.
 
 Two user-facing scenarios drive the design, and both are the **same behaviour** (probe continuously, re-auth the moment the portal drops traffic) — they differ only in how they start and what shell they wear:
 
@@ -189,7 +189,7 @@ Signature: `run_detection_loop(config, stop_event=None, status_callback=None, du
 1. `check_network()` on `check_url` at configured interval
 2. On failure, retry at `check_interval_fail` interval; after `fail_threshold` consecutive failures, trigger auth
 3. On success, wait `check_interval_ok` seconds before next check
-4. Monotonic retry deadlines cover failed and successful attempts; consecutive failures exponentially back off from the configured cooldown (default 30s) up to max(300s, cooldown)
+4. Monotonic retry deadlines cover failed and successful attempts; consecutive failures exponentially back off from the configured cooldown (first retry 3s, then 5s, 10s, 20s, up to 300s) up to max(300s, cooldown)
 5. Runs until `run_duration_minutes` (default 60, `0` = infinite) elapses, `stop_event` is set, or Ctrl+C
 
 ### Logging
