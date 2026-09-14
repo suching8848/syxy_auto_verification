@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Campus network auto-login tool (v1.7.3). Detects captive portal via HTTP content inspection and re-authenticates in the background. Runs as a Windows scheduled task or as a system tray app with notification area icon.
+Campus network auto-login tool (v1.7.4). Detects captive portal via HTTP content inspection and re-authenticates in the background. Runs as a Windows scheduled task or as a system tray app with notification area icon.
 
 Two user-facing scenarios drive the design, and both are the **same behaviour** (probe continuously, re-auth the moment the portal drops traffic) — they differ only in how they start and what shell they wear:
 
@@ -103,7 +103,7 @@ The flow deliberately does not trust the child's exit code alone:
 
 - `_is_admin()` (`shell32.IsUserAnAdmin`) picks the deploy path, and it must be checked **before** the registration command is built or run. When it is false, `_offer_elevated_restart()` asks for consent and then relaunches the program elevated (`_self_elevate()`) — the **only** place UAC is actually raised — and both `_deploy_silent_task()` and `_remove_silent_task()` return without running anything (creating *and* deleting a task are privileged; the delete path used to run unguarded, so a non-admin user saw "删除失败" for something they simply had no right to do). Previously the code ran the command in-process first, which can only end in 拒绝访问, and only then offered to restart elevated, while the explainer dialog promised "接下来会弹出系统权限窗口" — a promise `_run_elevated()` cannot keep, because it never elevates. The app still needs admin for nothing else.
 - `_task_exists()` is the authoritative success check and must use the **same mechanism as registration** (a PowerShell `Get-ScheduledTask` probe via `-EncodedCommand`). It previously shelled out to `schtasks.exe`, which on this Chinese Windows returned "not found" for a task that plainly existed — so a successful create was reported as a failure and the delete path silently did nothing.
-- A cancelled UAC comes back from `ShellExecuteW` as `ERROR_CANCELLED` (1223) and gets its own message inside `_self_elevate()`. `_run_elevated()` never elevates, so it can no longer produce that code — do not "handle" it there.
+- A cancelled UAC must be read from `GetLastError()`, never from the return value: `ShellExecuteW` only means success when it returns > 32, and the reason for a failure (cancel = `ERROR_CANCELLED` 1223) lives in the last error. `_shell_execute_runas()` + the pure `elevation_outcome(rc, last_error)` do that — shell32 is opened with `use_last_error=True`, the return value is taken as a pointer-width `HINSTANCE` (the default `c_int` truncates it), and the error is read immediately after the call. `_run_elevated()` never elevates, so it can never produce 1223 — do not "handle" it there.
 - `_run_elevated()` redirects the child's stdout+stderr into a file and reads it back, because `CREATE_NO_WINDOW` makes pipes useless — the real error text is what the user needs, and it is shown in the failure dialog (and, since `_report_task_failure()` also logs it, in `logs\` — so a remote user can send the log instead of screenshotting a dialog). **That relay file lives in `%TEMP%` and there is no `.bat` wrapper.** Writing it beside the exe is exactly what broke a copy deployed on the Desktop on a machine with Controlled Folder Access enabled (see the config-location note below): the write itself was blocked, so no command was ever sent and the panel could only report a bare failure — with admin rights making no difference, because the block is on the path, not the privilege. Dropping the wrapper also removes cmd's "which code page reads my batch file" hazard (a Chinese path decoded with a non-Chinese OEM code page) and lets the exit code come straight from the child; `gui_app.decode_child_output()` decodes the captured bytes while trying UTF-8 → the system OEM code page → ANSI, since a console-less child's output encoding follows the system locale.
 - `_report_task_failure()` always offers a way forward: relaunch self elevated via `ShellExecuteW(…, "runas", …)` (`_self_elevate`), or the parameter values for a manual `Register-ScheduledTask`.
 
@@ -113,7 +113,7 @@ The flow deliberately does not trust the child's exit code alone:
 
 **Config self-generation:** `GuiApp.__init__` calls `core.ensure_config_file()`, which writes `auto_login_config.json` next to the exe with defaults if none exists, so a fresh folder needs nothing but the exe.
 
-- **Scenario A** (`GuiApp`): window + tray. `start_monitor()` / `stop_monitor()` own a `core.run_detection_loop` thread that keeps probing (duration 0 = forever); the tray/close handlers only hide or exit the shell.
+- **Scenario A** (`GuiApp`): window + tray. `start_monitor()` / `stop_monitor()` own a `core.run_detection_loop` thread that keeps probing (duration 0 = forever); the tray/close handlers only hide or exit the shell. The tray is created with `start_worker=False` so it never runs a probe loop of its own — launching the GUI alone starts nothing, and 「停止守护」 really stops the only loop there is.
 - **Scenario B** (`core.run_silent_mode`): `--silent` never constructs a `tkinter.Tk()` at all. `plan_silent_window()` (pure, unit-tested) decides how long to stand by, then the same `run_detection_loop` runs with `duration_override`. `--now` means *start immediately*: `run_silent_mode` collapses the whole window to `now`, because passing `--now` at 00:15 against a 23:00 target and still blocking ~23 hours is the opposite of what that flag means (it previously only suppressed the roll-over to tomorrow). Note `--run-minutes` sets the duration while `--now` sets the start; `_test_silent_now` passes both.
 
 **Threading model — the one rule that matters:**
@@ -140,7 +140,7 @@ Uses ctypes to call Win32 APIs directly — zero external dependencies:
 - `Shell_NotifyIconW` (NIM_ADD/NIM_MODIFY/NIM_DELETE) — notification area icon
 - `CreatePopupMenu` + `TrackPopupMenu` — right-click context menu (status, show/hide console, exit)
 - `GetConsoleWindow` + `ShowWindow` — hide/restore terminal window
-- Spawns a daemon `threading.Thread` running `run_detection_loop` with `stop_event` and `status_callback`
+- Spawns a daemon `threading.Thread` running `run_detection_loop` with `stop_event` and `status_callback` — **only when `start_worker=True`** (the default). The GUI passes `start_worker=False` because its guard belongs to `GuiApp.start_monitor()` / `stop_monitor()`: with both running there were two detection loops and 「停止守护」 could only stop the GUI's, leaving the tray's alive until `run_duration_minutes` expired (the interface said 待命中 while the machine was still probing and re-authenticating). Console tray modes (`--tray`, menu [5]) keep the default. **The init-failure branch respects the same flag**: with `start_worker=False` it starts nothing and returns `False`; with the default it still falls back to a console probe, now passing `stop_event` so the fallback can actually be stopped. `run()` returns whether the tray came up, and `GuiApp` uses that to tell "tray exited → close the app" from "tray never came up → keep running window-only" (`_tray = None`, so ✕ exits instead of hiding into a tray that does not exist).
 - `status_callback` posts `WM_USER_TRAY_UPDATE` to the main thread for tooltip updates
 - `stop_event` enables clean shutdown: right-click Exit → `stop_event.set()` → `DestroyWindow` → `PostQuitMessage`
 
@@ -254,7 +254,7 @@ GUI/silent additions to `DEFAULT_CONFIG`:
 **Critical: `print()` ordering in `main()`.**
 The background mode check (`if not INTERACTIVE or args.background:`) MUST execute before any `print()` call. Under `pythonw.exe` (Task Scheduler), `sys.stdout` is `None` and `print()` throws. If you add logging or output before this check you will break background mode. The `INTERACTIVE` flag is set at module level with a try/except: `try: INTERACTIVE = sys.stdout.isatty()` / `except: INTERACTIVE = False`.
 
-**`TrayApp` has a built-in fallback.** If `_create_window()` or `_create_tray_icon()` raises (e.g., no desktop session), `TrayApp.run()` catches the exception and falls back to `run_detection_loop(config)` — this is a console-less fallback, not the tray app.
+**`TrayApp` has a built-in fallback.** If `_create_window()` or `_create_tray_icon()` raises (e.g., no desktop session), `TrayApp.run()` catches the exception and falls back to `run_detection_loop(config, stop_event=self._stop_event)` — a console-less fallback, not the tray app — **but only when `start_worker` is true**. With `start_worker=False` (the GUI) it starts nothing, returns `False`, and the caller drops to window-only mode; starting a loop there would resurrect the exact bug v1.7.4 fixed, and the fallback used to omit `stop_event`, so even the console case could not be stopped.
 
 **`_need_setup` checks different fields per `auth_method`.**
 `portal_post` requires `username` + `password`; `http` and `browser` require `portal_url`. This affects when the config wizard triggers.
@@ -282,7 +282,8 @@ The background mode check (`if not INTERACTIVE or args.background:`) MUST execut
 - Silent mode verified end to end on Windows: `CampusNet.exe --silent --now --run-minutes 1` exits with code 0 after ~62s with **no window handle at any point** and only log output.
 - `--silent` never constructs `tkinter.Tk()`, so it is safe in Session 0 and under Task Scheduler.
 - GUI: `_tick` checks an `_alive` flag and stops rescheduling once `_do_exit` tears the window down. A pending `after()` callback firing on a destroyed canvas raises `TclError: invalid command name` and spams tracebacks during shutdown.
-- Scenario A verified end to end (all 8 checks): tray icon created → window `normal` → ✕ withdraws it while the probe thread keeps guarding → reopen restores `normal` → quit wakes the tray thread and exits cleanly.
+- Scenario A verified end to end (all 8 checks): tray icon created → window `normal` → ✕ withdraws it → reopen restores `normal` → quit wakes the tray thread and exits cleanly. The guard exists only after 「开始守护」 (v1.7.4 removed the tray's own auto-started worker, which had been running a second loop behind the interface's back).
+- v1.7.4: `TrayApp(start_worker=False)` for the GUI (one loop, and stopping really stops); `elevation_outcome()` judges UAC cancellation from `GetLastError()` after checking `rc <= 32`.
 
 - Scheduled launches pass `--now`: the task trigger owns the start time; the process does not wait again for `silent_start_time`. GUI registration stops on errors and verifies the saved action and trigger before reporting success.
 - Release instructions `packaging/使用说明.txt` are included in version control alongside the release manifest.

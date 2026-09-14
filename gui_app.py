@@ -2266,6 +2266,31 @@ TRAY_ICON_B64 = (
 # ShellExecuteW 提权启动返回码：用户取消 UAC
 ERROR_CANCELLED = 1223
 
+# shell32 用 use_last_error=True 打开：ctypes 才会在每次调用前后保存/恢复线程的
+# last-error，`ctypes.get_last_error()` 读到的才是 ShellExecuteW 这一次的错误，
+# 而不是被别的调用冲掉的值。restype 必须显式设成指针宽度 —— HINSTANCE 是指针，
+# 默认 c_int 会截断，而"≤32 才算失败"这条判断正建立在返回值不被截断之上。
+try:
+    _SHELL32 = ctypes.WinDLL("shell32", use_last_error=True)
+    _SHELL32.ShellExecuteW.restype = ctypes.c_void_p
+    _SHELL32.ShellExecuteW.argtypes = [
+        ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+        ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_int]
+except OSError:                       # 非 Windows 或受限环境
+    _SHELL32 = None
+
+
+def _shell_execute_runas(exe, params, workdir, show=1):
+    """ShellExecuteW(..., "runas", ...)：真正会弹 UAC 的那一步。
+
+    返回 (返回值, GetLastError())，两者一起读出来 —— 中间不插任何 Python 代码，
+    免得 last-error 被别的东西改写。返回值 > 32 才算成功。
+    """
+    if _SHELL32 is None:
+        raise RuntimeError("shell32 不可用，无法请求管理员权限")
+    rc = int(_SHELL32.ShellExecuteW(None, "runas", exe, params, workdir, show) or 0)
+    return rc, ctypes.get_last_error()
+
 MF_STRING = 0x00000000
 MF_GRAYED = 0x00000001
 MF_SEPARATOR = 0x00000800
@@ -2342,8 +2367,12 @@ class GUITray(core.TrayApp):
     """
 
     def __init__(self, config, on_open_window, on_exit):
+        # start_worker=False 是必须的：GUI 的守护线程归 start_monitor()/stop_monitor()
+        # 管，托盘若再自带一路，就会出现两个探测循环同时跑，而「停止守护」只停得掉
+        # 界面那一路（界面显示"待命中"，后台仍在探测和重连）。
         core.TrayApp.__init__(self, config, start_hidden=False,
-                              status_text="待命中", on_error=self._report_error)
+                              status_text="待命中", on_error=self._report_error,
+                              start_worker=False)
         self._menu = None
         self._item_status = CMD_OPEN_WINDOW
         self._on_open_window = on_open_window
@@ -2540,6 +2569,25 @@ def decode_child_output(raw):
     return raw.decode("utf-8", errors="replace")
 
 
+def elevation_outcome(rc, last_error):
+    """判读 ShellExecuteW("runas") 的结果，返回 (状态, 给用户看的原因)。
+
+    API 契约：返回值 > 32 才算启动成功（那是一个 HINSTANCE 假值，不是错误码）；
+    ≤ 32 表示失败，**具体原因在 GetLastError() 里**，UAC 被取消是
+    ERROR_CANCELLED (1223)。直接拿返回值跟 1223 比是不可靠的：失败时返回的也是
+    SE_ERR_*/ERROR_* 家族里的某一个，没有任何保证恰好是 1223 —— 真实取消很可能
+    落到 else 分支，用户只看到一句没头没尾的"提权启动失败"。
+    """
+    if rc > 32:
+        return "started", ""
+    if last_error == ERROR_CANCELLED:
+        return "cancelled", "你在系统权限窗口点了「否」，所以什么都没做"
+    detail = f"错误码 {rc}"
+    if last_error:
+        detail += f"（GetLastError={last_error}）"
+    return "failed", detail
+
+
 class GuiApp:
     """场景 A 主程序：主线程跑托盘消息循环，窗口线程跑 tkinter。"""
 
@@ -2606,12 +2654,16 @@ class GuiApp:
         return 0
 
     def _tray_thread(self):
+        tray_available = False
         try:
-            self._tray.run()
+            tray_available = self._tray.run()
+        except Exception as e:
+            # 托盘消息循环自己崩了：按"没有托盘"处理，让窗口继续活着
+            core.log(f"Tray thread crashed: {e}", "ERROR")
         finally:
             self._tray_exited.set()
             if not self._shutting_down:
-                self._q.put(("tray_exited", None))
+                self._q.put(("tray_exited", tray_available))
 
     def _shutdown(self):
         if self._shutting_down:
@@ -2777,8 +2829,16 @@ class GuiApp:
         elif kind == "exit":
             self._do_exit(payload)
         elif kind == "tray_exited":
-            self._log("托盘已退出，程序即将关闭。", "dim")
-            self._do_exit(None)
+            if payload:
+                self._log("托盘已退出，程序即将关闭。", "dim")
+                self._do_exit(None)
+            else:
+                # 托盘从来没建起来（没有桌面会话、图标注册被拒、或消息循环崩了）。
+                # 退回无托盘窗口模式：程序不能就此退出（用户还看着窗口），也不能
+                # 偷偷开始探测（守护只能由「开始守护」发起）。_tray 置空之后
+                # _on_close_request 会把 ✕ 当作退出，不会把窗口藏进一个不存在的托盘。
+                self._tray = None
+                self._log("托盘不可用，已改为无托盘窗口模式（关闭窗口即退出）。", "warn")
 
     def _queue_exit(self, reason):
         """可从任意线程调用 — 只入队。"""
@@ -3222,8 +3282,12 @@ class GuiApp:
         """用管理员身份重新打开本程序。
 
         这是本程序唯一真正触发 UAC 的地方：ShellExecuteW 的 "runas" 会让 Windows
-        弹出权限窗口，用户点「是」才有一个提权后的新进程。返回 1223 表示用户在那
-        个窗口点了「否」—— 要单独说清楚，不然用户看到"错误码 1223"只会一头雾水。
+        弹出权限窗口，用户点「是」才有一个提权后的新进程。
+
+        判读必须走 `elevation_outcome()`：ShellExecuteW 只在返回值 ≤ 32 时表示失败，
+        失败原因要去 GetLastError() 里取（取消 UAC = 1223）。用 use_last_error=True
+        打开 shell32，ctypes 才会自动保存/恢复线程的 last-error，否则它可能已被
+        别的调用冲掉。
         """
         try:
             if getattr(sys, "frozen", False):
@@ -3231,19 +3295,19 @@ class GuiApp:
             else:
                 exe = sys.executable
                 params = f'"{os.path.abspath(__file__)}"'
-            rc = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", exe, params, core.exe_dir(), 1)
-            if rc == ERROR_CANCELLED:
+            rc, last_error = _shell_execute_runas(exe, params, core.exe_dir())
+            outcome, detail = elevation_outcome(rc, last_error)
+            if outcome == "cancelled":
                 messagebox.showwarning(
                     "你取消了权限请求",
-                    f"{reason}\n\n你在系统权限窗口点了「否」，所以什么都没做。\n"
+                    f"{reason}\n\n{detail}。\n\n"
                     "想继续的话，重新点一次按钮、在权限窗口点「是」；"
                     "或者右键 CampusNet.exe →「以管理员身份运行」。")
                 return False
-            if rc <= 32:
+            if outcome == "failed":
                 messagebox.showwarning(
                     "没能提权",
-                    f"{reason}\n\n提权启动失败（错误码 {rc}）。\n"
+                    f"{reason}\n\n提权启动失败（{detail}）。\n"
                     "可以右键 CampusNet.exe →「以管理员身份运行」再试。")
                 return False
             self._do_exit(None)

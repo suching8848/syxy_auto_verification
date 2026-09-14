@@ -19,7 +19,7 @@ if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "v1.7.3"
+VERSION = "v1.7.4"
 
 # Required on Windows 11 for tray icon to appear — set before any window creation
 try:
@@ -932,12 +932,21 @@ class TrayApp:
     Uses ctypes to call Win32 Shell_NotifyIcon API — zero external dependencies."""
 
     def __init__(self, config, start_hidden=False, status_text="Initializing...",
-                 on_error=None, on_done=None):
+                 on_error=None, on_done=None, start_worker=True):
+        """`start_worker=False` 只建图标和消息循环，不自己起探测线程。
+
+        GUI（场景 A）必须传 False：那里的守护由 `GuiApp.start_monitor()` /
+        `stop_monitor()` 拥有，托盘再自带一路就会变成两个 `run_detection_loop`
+        同时探测，而点「停止守护」只停得掉界面那一路 —— 界面显示"待命中"，后台还在
+        重连。控制台/托盘模式（`--tray`、菜单 [5]）继续用默认的 True，它们的守护
+        线程本来就是托盘自己的。
+        """
         self._config = config.copy()
         if start_hidden:
             self._config["run_duration_minutes"] = 0
         self._stop_event = threading.Event()
         self._worker = None
+        self._start_worker = start_worker
         self._status = status_text
         self._on_error = on_error
         self._on_done = on_done
@@ -950,23 +959,37 @@ class TrayApp:
     # ── public API ────────────────────────────────────────────────────────
 
     def run(self):
-        """Entry point. Creates window + tray icon, starts worker, enters message loop."""
+        """Entry point. Creates window + tray icon, starts worker, enters message loop.
+
+        Returns True only when the tray really came up. False means "no tray at
+        all" (window/icon creation failed) — the GUI uses that to drop back to
+        window-only mode instead of exiting the program.
+        """
         try:
             self._create_window()
             self._create_tray_icon()
         except Exception as e:
+            if not self._start_worker:
+                # GUI：没有托盘就回到无托盘窗口模式，调用方会自己保证"没点就不跑"。
+                log(f"Tray init failed: {e}; no tray, caller keeps its own guard",
+                    "ERROR")
+                return False
             log(f"Tray init failed: {e}, falling back to console", "ERROR")
-            run_detection_loop(self._config)
-            return
+            # 回退也要能停：把托盘的停止事件交给探测循环，否则 Ctrl+C 之外
+            # 没有任何办法让它退出。
+            run_detection_loop(self._config, stop_event=self._stop_event)
+            return False
 
         # hide console initially if requested
         if self._start_hidden:
             self._hide_console()
 
-        self._worker = threading.Thread(target=self._detection_worker, daemon=True)
-        self._worker.start()
+        if self._start_worker:
+            self._worker = threading.Thread(target=self._detection_worker, daemon=True)
+            self._worker.start()
         self._message_loop()
         self._cleanup()
+        return True
 
     # ── console show/hide ─────────────────────────────────────────────────
 

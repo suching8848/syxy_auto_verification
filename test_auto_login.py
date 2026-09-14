@@ -474,6 +474,116 @@ class TaskRunTests(unittest.TestCase):
         self.assertEqual(gui_app.decode_child_output(b""), "")
 
 
+class TrayWorkerTests(unittest.TestCase):
+    """托盘的探测线程必须是可选的 —— GUI 传 start_worker=False。
+
+    这是 P1 回归守卫：基类以前无条件启动 worker，GUI 又让 start_monitor() 再起
+    一路，于是两个 run_detection_loop 同时探测，而「停止守护」只停得掉界面那一路
+    （界面显示"待命中"，后台还在探测与重连）。--silent 不创建托盘，不走这条路。
+    """
+
+    def setUp(self):
+        self.config = dict(app.DEFAULT_CONFIG, username="student", password="test")
+
+    def _run_tray(self, tray):
+        with patch.object(tray, "_create_window"), \
+             patch.object(tray, "_create_tray_icon"), \
+             patch.object(tray, "_message_loop"), \
+             patch.object(tray, "_cleanup"):
+            return tray.run()
+
+    def test_start_worker_false_spawns_no_detection_loop(self):
+        tray = app.TrayApp(self.config, start_worker=False)
+        with patch.object(app, "run_detection_loop") as run:
+            self.assertTrue(self._run_tray(tray))
+            if tray._worker:
+                tray._worker.join(2)
+        run.assert_not_called()
+        self.assertIsNone(tray._worker)
+
+    def test_default_still_starts_the_worker_for_console_modes(self):
+        """--tray / 菜单 [5] 的守护线程本来就是托盘自己的，不能被一起改掉。"""
+        tray = app.TrayApp(self.config)
+        with patch.object(app, "run_detection_loop") as run:
+            self.assertTrue(self._run_tray(tray))
+            self.assertIsNotNone(tray._worker)
+            tray._worker.join(2)
+        run.assert_called_once()
+
+    def test_gui_tray_does_not_start_its_own_worker(self):
+        import gui_app
+        tray = gui_app.GUITray(self.config, on_open_window=lambda: None,
+                               on_exit=lambda reason=None: None)
+        self.assertFalse(tray._start_worker)
+
+    def test_window_creation_failure_starts_no_loop_when_start_worker_is_false(self):
+        """异常路径同样不能擅自探测：窗口建不出来时 GUI 必须保持"没点就不跑"。"""
+        tray = app.TrayApp(self.config, start_worker=False)
+        with patch.object(tray, "_create_window",
+                          side_effect=RuntimeError("no desktop session")), \
+             patch.object(app, "run_detection_loop") as run:
+            self.assertFalse(tray.run())
+        run.assert_not_called()
+
+    def test_icon_creation_failure_starts_no_loop_when_start_worker_is_false(self):
+        tray = app.TrayApp(self.config, start_worker=False)
+        with patch.object(tray, "_create_window"), \
+             patch.object(tray, "_create_tray_icon",
+                          side_effect=RuntimeError("Shell_NotifyIcon denied")), \
+             patch.object(app, "run_detection_loop") as run:
+            self.assertFalse(tray.run())
+        run.assert_not_called()
+
+    def test_console_fallback_still_probes_and_gets_the_stop_event(self):
+        """--tray 的守护本来就归托盘管：初始化失败时保留回退，但必须可停止。"""
+        tray = app.TrayApp(self.config)
+        with patch.object(tray, "_create_window",
+                          side_effect=RuntimeError("no desktop session")), \
+             patch.object(app, "run_detection_loop") as run:
+            self.assertFalse(tray.run())
+        run.assert_called_once()
+        self.assertIs(run.call_args.kwargs["stop_event"], tray._stop_event)
+
+    def test_console_fallback_also_returns_false_so_callers_know_there_is_no_tray(self):
+        tray = app.TrayApp(self.config)
+        with patch.object(tray, "_create_window"), \
+             patch.object(tray, "_create_tray_icon", side_effect=RuntimeError("denied")), \
+             patch.object(app, "run_detection_loop"):
+            self.assertFalse(tray.run())
+
+
+class ElevationOutcomeTests(unittest.TestCase):
+    """ShellExecuteW 的判读：>32 成功，≤32 失败且原因在 GetLastError() 里。"""
+
+    def setUp(self):
+        import gui_app
+        self.gui = gui_app
+
+    def test_return_value_above_32_means_started(self):
+        self.assertEqual(self.gui.elevation_outcome(42, 0)[0], "started")
+        self.assertEqual(self.gui.elevation_outcome(0x1234, 0)[0], "started")
+
+    def test_cancelled_uac_is_read_from_last_error_not_the_return_value(self):
+        # 真实取消：返回值是 ≤32 的失败码，1223 只在 GetLastError() 里。
+        # 拿返回值直接跟 1223 比会落到 failed 分支，专门的取消提示就失效了。
+        self.assertEqual(self.gui.elevation_outcome(5, self.gui.ERROR_CANCELLED)[0],
+                         "cancelled")
+        self.assertEqual(self.gui.elevation_outcome(0, self.gui.ERROR_CANCELLED)[0],
+                         "cancelled")
+
+    def test_other_failures_stay_generic_and_report_both_codes(self):
+        outcome, detail = self.gui.elevation_outcome(2, 5)
+        self.assertEqual(outcome, "failed")
+        self.assertIn("2", detail)
+        self.assertIn("5", detail)
+
+    def test_cancelled_message_is_not_the_generic_failure(self):
+        cancelled = self.gui.elevation_outcome(5, self.gui.ERROR_CANCELLED)[1]
+        failed = self.gui.elevation_outcome(5, 87)[1]
+        self.assertIn("「否」", cancelled)
+        self.assertNotEqual(cancelled, failed)
+
+
 class GuiLogicTests(unittest.TestCase):
     """Only the pure translation layer — never instantiate a Tk window."""
 
@@ -662,6 +772,20 @@ class GuiLifecycleTests(unittest.TestCase):
         self.ui._run_elevated.assert_not_called()
         self.ui._self_elevate.assert_called_once()
 
+    def test_tray_that_never_came_up_keeps_the_window_mode_alive(self):
+        """托盘建不起来时不能顺手关掉程序，也不能偷偷开始守护。"""
+        self.ui._tray = Mock()
+        self.ui._do_exit = Mock()
+        self.ui._handle_message("tray_exited", False)
+        self.ui._do_exit.assert_not_called()
+        self.assertIsNone(self.ui._tray)
+
+    def test_normal_tray_exit_still_closes_the_app(self):
+        self.ui._tray = Mock()
+        self.ui._do_exit = Mock()
+        self.ui._handle_message("tray_exited", True)
+        self.ui._do_exit.assert_called_once()
+
     def test_task_failure_detail_is_written_to_the_log_file(self):
         """失败详情必须落盘到 logs\\：关掉窗口后，这行日志是唯一能要来排障的证据。
 
@@ -734,7 +858,7 @@ class ReleaseManifestTests(unittest.TestCase):
         import runpy
         import zipfile
         root = os.path.dirname(os.path.abspath(__file__))
-        with patch.object(sys, "argv", ["make_release_zip.py", "1.7.3"]):
+        with patch.object(sys, "argv", ["make_release_zip.py", "1.7.4"]):
             module = runpy.run_path(os.path.join(root, "packaging", "make_release_zip.py"))
         with tempfile.TemporaryDirectory() as staging:
             for src, _ in module["MANIFEST"]:
@@ -752,7 +876,7 @@ class ReleaseManifestTests(unittest.TestCase):
             module["main"].__globals__["ROOT"] = staging
             with contextlib.redirect_stdout(io.StringIO()):
                 module["main"]()
-            with zipfile.ZipFile(os.path.join(staging, "dist", "auto_login_v1.7.3.zip")) as z:
+            with zipfile.ZipFile(os.path.join(staging, "dist", "auto_login_v1.7.4.zip")) as z:
                 names = z.namelist()
             self.assertTrue(any(n.endswith("使用说明.txt") for n in names))
             self.assertFalse(any(n.endswith("auto_login_config.json") for n in names))

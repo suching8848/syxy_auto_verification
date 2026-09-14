@@ -1,6 +1,6 @@
 """打包发布 zip —— 只收白名单里的文件，杜绝把配置和日志带出去。
 
-背景：运行目录（dist\auto_login_v1.7.3）同时也是计划任务的部署目录，
+背景：运行目录（dist\auto_login_v1.7.4）同时也是计划任务的部署目录，
 里面装着用户自己的 auto_login_config.json（含明文密码）和 logs\。
 直接 Compress-Archive 整个目录会把这些一起打进 zip —— 上传到 GitHub
 就等于公开泄漏密码。
@@ -17,7 +17,7 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-VERSION = sys.argv[1] if len(sys.argv) > 1 else "1.7.3"
+VERSION = sys.argv[1] if len(sys.argv) > 1 else "1.7.4"
 NAME = f"auto_login_v{VERSION}"
 
 # 只有这些文件会进发布包，一个都不多
