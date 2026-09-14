@@ -32,8 +32,10 @@ import ctypes
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -2513,6 +2515,31 @@ class GUITray(core.TrayApp):
             pass
 
 
+def decode_child_output(raw):
+    """把子进程写进文件的输出解码成文本。
+
+    包装带的 CREATE_NO_WINDOW 让子进程没有控制台，PowerShell 那段报错文本按哪个
+    编码落盘就取决于系统区域设置（中文系统 cp936、英文 cp1252/cp437），而且没有
+    参数能可靠地指定它。所以按「UTF-8 → 系统 OEM 代码页 → 系统 ANSI」依次试：
+    cp936 的中文按 UTF-8 严格解码会失败，于是落到 OEM 分支；真写成了 UTF-8 的则
+    第一轮就中。哪一步都不成就退化成替换字符，至少不会整个异常吞掉。
+    """
+    encodings = ["utf-8"]
+    try:
+        oem = ctypes.windll.kernel32.GetOEMCP()
+        if oem:
+            encodings.append(f"cp{oem}")
+    except Exception:
+        pass
+    encodings.append("mbcs")
+    for enc in encodings:
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
 class GuiApp:
     """场景 A 主程序：主线程跑托盘消息循环，窗口线程跑 tkinter。"""
 
@@ -3123,6 +3150,11 @@ class GuiApp:
             messagebox.showerror("保存失败", f"写不进配置：\n{target}\n请检查目录权限。")
             return None
         self._config = new
+        # 配置跑到程序目录外面去了，多半是「受控文件夹访问 / 只读目录」挡的 ——
+        # 不说明的话，用户会以为设置没保存（程序旁边那个旧文件确实没变）。
+        if os.path.dirname(os.path.abspath(target)) != os.path.abspath(core.exe_dir()):
+            self._log(f"程序目录写不进去（受控文件夹访问或只读），"
+                      f"设置已改存到：{target}", "warn")
         return target
 
     def _save_settings(self):
@@ -3187,7 +3219,12 @@ class GuiApp:
             return False
 
     def _self_elevate(self, reason):
-        """用管理员身份重新打开本程序（弹一次 UAC，之后所有操作都不再需要）。"""
+        """用管理员身份重新打开本程序。
+
+        这是本程序唯一真正触发 UAC 的地方：ShellExecuteW 的 "runas" 会让 Windows
+        弹出权限窗口，用户点「是」才有一个提权后的新进程。返回 1223 表示用户在那
+        个窗口点了「否」—— 要单独说清楚，不然用户看到"错误码 1223"只会一头雾水。
+        """
         try:
             if getattr(sys, "frozen", False):
                 exe, params = sys.executable, ""
@@ -3196,6 +3233,13 @@ class GuiApp:
                 params = f'"{os.path.abspath(__file__)}"'
             rc = ctypes.windll.shell32.ShellExecuteW(
                 None, "runas", exe, params, core.exe_dir(), 1)
+            if rc == ERROR_CANCELLED:
+                messagebox.showwarning(
+                    "你取消了权限请求",
+                    f"{reason}\n\n你在系统权限窗口点了「否」，所以什么都没做。\n"
+                    "想继续的话，重新点一次按钮、在权限窗口点「是」；"
+                    "或者右键 CampusNet.exe →「以管理员身份运行」。")
+                return False
             if rc <= 32:
                 messagebox.showwarning(
                     "没能提权",
@@ -3208,59 +3252,76 @@ class GuiApp:
             messagebox.showerror("提权失败", f"{reason}\n\n{e}")
             return False
 
+    def _offer_elevated_restart(self, action, extra=""):
+        """非管理员时，先征得同意再重开自己 —— 提权由那次启动触发。
+
+        `action` 是这次要做的特权操作（"开启每天自动守护" / "取消每天自动守护"），
+        `extra` 用来补一句这次的具体设置。
+
+        以前是"就地跑一遍、失败了再问"，而就地跑注定拿不到权限：用户看到的是
+        「提示说要弹权限窗口，窗口没出现，然后告诉我失败了」。改计划任务必须提权，
+        所以先把这一步做完再动手，界面说的和系统做的才是一回事。
+        """
+        if not messagebox.askokcancel(
+                "需要管理员权限",
+                f"「{action}」要改 Windows 计划任务，这一步必须有管理员权限。\n\n"
+                "点「确定」后本程序会重新启动，并弹出系统权限窗口（UAC）——\n"
+                "那一瞬间屏幕变暗、其它窗口不能点是正常的，请点「是」。\n\n"
+                "重新打开后回到「每天自动守护」页，再操作一次即可。" + extra + "\n\n"
+                "也可以直接关掉这个窗口，右键 CampusNet.exe →「以管理员身份运行」。"
+        ):
+            return False
+        return self._self_elevate(f"需要管理员权限才能{action}。")
+
     def _explain_elevation(self):
-        """不是管理员时，在弹 UAC 之前先把话说清楚。返回 False 表示用户放弃。"""
-        detail = (
-            "「开启每天自动守护」需要注册一个 Windows 计划任务，"
-            "这一步必须有管理员权限。\n\n"
-            "接下来会弹出系统权限窗口，请点「是」——\n"
-            "那一瞬间屏幕变暗、其它窗口不能点是正常的。\n\n"
-            "你不需要为此单独用管理员身份打开本程序，点「是」就够了。"
-        )
-        if not self._is_admin():
-            return messagebox.askokcancel(
-                "即将请求管理员权限", detail + "\n\n现在继续吗？")
+        """已经提权时的最后确认。返回 False 表示用户放弃。
+
+        只负责"要创建什么"，不再承诺会弹 UAC —— 那件事由
+        `_offer_elevated_restart()` 在非管理员分支里真正做掉。
+        """
         return messagebox.askokcancel(
             "创建每天自动守护",
             f"将在 {self._config.get('silent_start_time')} 创建每日静默守护任务，"
             f"运行 {self._config.get('silent_run_minutes')} 分钟。\n\n继续吗？")
 
     def _run_elevated(self, command):
-        """用 UAC 提权跑一条命令，返回 (退出码, 命令, 输出)。
+        """跑一条注册/删除任务的命令，返回 (退出码, 命令, 输出)。
 
-        输出必须重定向进文件再读回来：包装用的 cmd 带 CREATE_NO_WINDOW，
-        管道抓不到子进程的输出，而「脚本到底报了什么错」恰恰是排查失败时
-        唯一有用的信息。用户取消 UAC 时 code = 1223。
+        输出必须由 Python 自己重定向到文件再读回来：包装带的 CREATE_NO_WINDOW
+        让子进程没有控制台，管道抓不到它的输出，而「脚本到底报了什么错」恰恰是
+        排查失败时唯一有用的信息。
+
+        注意这里**不提权**：它只是用当前进程的权限跑一条命令。调用方必须在
+        `_is_admin()` 为真时才走到这里（见 `_offer_elevated_restart()`），否则
+        `Register-ScheduledTask` 只会回一句「拒绝访问」—— 那正是"用管理员身份打开
+        也没用"之外的另一半坑：没提权却以为提了。
+
+        这个中转文件**只能**放 %TEMP%，绝不能放程序目录（旧实现就放在那里）：
+
+        * Windows 的受控文件夹访问（勒索软件防护）会拦住未签名程序往「桌面 /
+          文档 / 图片」这类受保护目录写文件，而本程序常常就摆在桌面上。那时连
+          命令都发不出去，界面只好报一个没头没尾的失败 —— 看着像权限问题，用
+          管理员身份重开也没用，因为拦的是路径不是权限。%TEMP% 不在保护范围内。
+        * 不再需要 .bat 这层包装，于是「cmd 按哪个代码页读脚本」的坑（路径里的
+          中文被解码坏、重定向到乱码路径）一并消失，退出码也直接用子进程自己的。
+
+        command 允许是空格分隔的命令行字符串：-EncodedCommand 的 base64 里不含
+        空格，直接切分是安全的。
         """
-        bat = os.path.join(core.get_runtime_dir(), "_campusnet_task.bat")
-        out = os.path.join(core.get_runtime_dir(), "_campusnet_task.out")
+        argv = command.split() if isinstance(command, str) else list(command)
+        work = tempfile.mkdtemp(prefix="campusnet_task_")
+        out = os.path.join(work, "out.txt")
         try:
-            with open(bat, "w", encoding="gbk") as f:
-                f.write("@echo off\r\n")
-                f.write("chcp 65001 >nul\r\n")       # 输出按 UTF-8 落盘
-                f.write(f'{command} > "{out}" 2>&1\r\n')
-                f.write(f'echo EXITCODE=%ERRORLEVEL% >> "{out}"\r\n')
-            subprocess.run(["cmd", "/c", bat], capture_output=True,
-                           creationflags=0x08000000)
-            if not os.path.exists(out):
-                return -2, command, "(脚本没有任何输出)"
-            with open(out, "r", encoding="utf-8", errors="replace") as f:
+            with open(out, "wb") as fh:
+                proc = subprocess.run(argv, stdout=fh, stderr=subprocess.STDOUT,
+                                      creationflags=0x08000000)
+            with open(out, "rb") as f:
                 raw = f.read()
-            body, _, tail = raw.rpartition("EXITCODE=")
-            try:
-                code = int(tail.strip())
-            except ValueError:
-                code = -2
-            return code, command, body.strip()
+            return proc.returncode, command, decode_child_output(raw).strip()
         except Exception as e:
             return -1, f"(无法执行: {e})", ""
         finally:
-            for path in (bat, out):
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                except OSError:
-                    pass
+            shutil.rmtree(work, ignore_errors=True)
 
     def _report_task_failure(self, reason, command, output=""):
         """失败时给一条能自己走通的路，而不是只说一句「失败了」。
@@ -3272,6 +3333,12 @@ class GuiApp:
         start_at = self._config.get("silent_start_time")
         run_min = self._config.get("silent_run_minutes")
         script = os.path.join(core.exe_dir(), "setup_task.ps1")
+        # 必须走 core.log()：它才负责落盘到 logs\auto_login_YYYY-MM-DD.log
+        # （self._log() 只往界面的文本框里写）。这台电脑上是弹窗给人看，
+        # 别人电脑上只有这一行日志能要过来，关掉窗口就没了等于没记。
+        core.log("计划任务操作失败：" + reason
+                 + (f"｜程序回报：{output.strip()[:600]}" if output else ""),
+                 "ERROR")
         lines = [reason, ""]
         if output:
             lines += ["程序回报：", output.strip()[:600], ""]
@@ -3416,22 +3483,23 @@ class GuiApp:
             return
         start_at = parsed_time.strftime("%H:%M")
         run_min = self._config["silent_run_minutes"]
+        # 没提权就不要往下走了：Register-ScheduledTask 一定会被拒，用户只会看到
+        # 「失败了」。先把提权做完（重开自己 → 由那次启动触发 UAC）再动手。
+        if not self._is_admin():
+            if not self._offer_elevated_restart(
+                    "开启每天自动守护",
+                    f"\n（想在 {start_at} 静默守护 {run_min} 分钟的话，设置已经保存好了。）"):
+                self.mode_note.configure(text="已取消，没有做任何改动。", fg="#6b7280")
+            return
         if not self._explain_elevation():
             self.mode_note.configure(text="已取消，没有做任何改动。", fg="#6b7280")
             return
 
         cmd = self._task_register_command(start_at, run_min)
-        self.mode_note.configure(text="正在请求管理员权限…请在弹出的系统窗口点「是」。",
-                                 fg="#6b7280")
+        self.mode_note.configure(text="正在创建每日任务…", fg="#6b7280")
         self.root.update_idletasks()
 
         rc, ran_cmd, output = self._run_elevated(cmd)
-
-        if rc == ERROR_CANCELLED:
-            self.mode_note.configure(text="你取消了管理员权限请求，任务没有创建。", fg="#cc2b2b")
-            self._report_task_failure(
-                "你在系统权限窗口点了「否」，所以任务没有创建。", ran_cmd, output)
-            return
 
         if rc == 0 and self._task_exists():
             self.mode_note.configure(
@@ -3452,6 +3520,12 @@ class GuiApp:
     def _remove_silent_task(self):
         if not self._task_exists():
             self.mode_note.configure(text="当前没有每日任务，不需要取消。", fg="#6b7280")
+            return
+        if not self._is_admin():
+            # 删除任务同样要提权：就地跑只会拿到「拒绝访问」，然后报一个
+            # 让人以为"删不掉"的失败。
+            if not self._offer_elevated_restart("取消每天自动守护"):
+                self.mode_note.configure(text="已取消，没有做任何改动。", fg="#6b7280")
             return
         if not messagebox.askyesno("取消每天自动守护",
                                    "确定要删除每日静默守护任务吗？\n"

@@ -327,6 +327,152 @@ class ConfigWriteTests(unittest.TestCase):
             self.assertFalse(app.save_config(dict(app.DEFAULT_CONFIG),
                                              path=os.path.join(d, "missing", "\0bad")))
 
+    def test_writable_program_dir_keeps_config_beside_the_exe(self):
+        with tempfile.TemporaryDirectory() as home, \
+                tempfile.TemporaryDirectory() as appdata:
+            # CONFIG_FILE 也指到空目录：从源码跑时它是"程序目录里没有配置"的旧兜底，
+            # 不屏蔽掉就会读到仓库里那份真配置。
+            with patch.object(app, "exe_dir", return_value=home), \
+                 patch.object(app, "CONFIG_FILE",
+                              os.path.join(home, "absent.json")), \
+                 patch.dict(os.environ, {"APPDATA": appdata}):
+                app._reset_path_cache()
+                self.addCleanup(app._reset_path_cache)
+                beside = os.path.join(home, app.CONFIG_FILENAME)
+                self.assertEqual(app.config_write_path(), beside)
+                self.assertEqual(app.find_config_file(), beside)
+
+    def test_protected_program_dir_falls_back_to_appdata(self):
+        """受控文件夹访问（勒索软件防护）挡住程序目录时的行为。
+
+        真实症状：放在桌面的 CampusNet.exe 用管理员身份也建不了计划任务，因为
+        写不进「桌面」—— 配置和任务的临时文件都撞在这上面。这里断言两件事：配置
+        改存 %APPDATA%，而且之后读的也是 %APPDATA% 那份，不会出现"写进去却还在
+        读旧文件"的错位。
+        """
+        with tempfile.TemporaryDirectory() as home, \
+                tempfile.TemporaryDirectory() as appdata:
+            beside = os.path.join(home, app.CONFIG_FILENAME)
+            with open(beside, "w", encoding="utf-8") as f:
+                f.write(json.dumps(dict(app.DEFAULT_CONFIG, username="stale")))
+            # 只让"程序目录"写不进去，%APPDATA% 照样可写（CFA 就是这么拦的：拦路径）
+            unwritable = lambda d: os.path.abspath(d) != os.path.abspath(home)
+            with patch.object(app, "exe_dir", return_value=home), \
+                 patch.object(app, "CONFIG_FILE",
+                              os.path.join(home, "absent.json")), \
+                 patch.object(app, "_dir_writable", side_effect=unwritable), \
+                 patch.dict(os.environ, {"APPDATA": appdata}):
+                app._reset_path_cache()
+                self.addCleanup(app._reset_path_cache)
+                target = app.config_write_path()
+                expected = os.path.join(appdata, "CampusNet", app.CONFIG_FILENAME)
+                self.assertEqual(target, expected)
+                self.assertTrue(app.save_config(dict(app.DEFAULT_CONFIG, username="fresh"),
+                                                path=target))
+                self.assertEqual(app.find_config_file(), expected)
+                with open(expected, encoding="utf-8") as f:
+                    self.assertEqual(json.load(f)["username"], "fresh")
+                # 日志也要跟着走：否则静默守护每晚跑完一条记录都不留
+                self.assertEqual(app.get_runtime_dir(), os.path.dirname(expected))
+
+    def test_read_only_program_dir_without_appdata_still_reads_beside(self):
+        with tempfile.TemporaryDirectory() as home, \
+                tempfile.TemporaryDirectory() as appdata:
+            beside = os.path.join(home, app.CONFIG_FILENAME)
+            with open(beside, "w", encoding="utf-8") as f:
+                f.write("{}")
+            unwritable = lambda d: os.path.abspath(d) != os.path.abspath(home)
+            with patch.object(app, "exe_dir", return_value=home), \
+                 patch.object(app, "CONFIG_FILE",
+                              os.path.join(home, "absent.json")), \
+                 patch.object(app, "_dir_writable", side_effect=unwritable), \
+                 patch.dict(os.environ, {"APPDATA": appdata}):
+                app._reset_path_cache()
+                self.addCleanup(app._reset_path_cache)
+                # 只有程序目录里那份配置可读 —— 必须继续读它，不能因为写不进去就丢
+                self.assertEqual(app.find_config_file(), beside)
+                # 但日志得改存到写得进去的地方
+                self.assertEqual(app.get_runtime_dir(),
+                                 os.path.join(appdata, "CampusNet"))
+
+    def test_dir_writable_is_false_for_missing_directory(self):
+        import uuid
+        missing = os.path.join(tempfile.gettempdir(), f"campusnet-{uuid.uuid4().hex}")
+        self.assertFalse(app._dir_writable(missing))
+
+    def test_dir_writable_cleans_up_its_probe_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertTrue(app._dir_writable(d))
+            self.assertEqual(os.listdir(d), [])
+
+
+class TaskRunTests(unittest.TestCase):
+    """`_run_elevated` 的中转文件必须落在 %TEMP%，不能落在程序目录。
+
+    回归守卫：旧实现把 .bat/.out 写在程序目录里，而程序常常就在桌面上 ——
+    受控文件夹访问会拦住这次写入，于是明明只是"写不了自己的目录"，却表现成
+    "任务创建失败（退出码 -1）"，管理员身份重开也没用。
+    """
+
+    def _ui(self):
+        import gui_app
+        return gui_app.GuiApp.__new__(gui_app.GuiApp)   # 不建窗口
+
+    def test_encoded_command_string_runs_through_the_runner(self):
+        """跑一条与 _task_register_command 同形状的命令，验证整条链：
+
+        字符串按空格切分 → subprocess（CREATE_NO_WINDOW + 文件重定向）→ 临时文件
+        → 解码 → 子进程退出码。失败时 PowerShell 抛出的报错文本必须能读回来，
+        否则弹窗里的「程序回报」又是一句没用的空话。
+        """
+        import base64
+        ui = self._ui()
+        prefix = "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand "
+        encode = lambda s: base64.b64encode(s.encode("utf-16-le")).decode("ascii")
+
+        code, _, out = ui._run_elevated(prefix + encode("exit 0"))
+        self.assertEqual(code, 0, out)
+
+        code, _, out = ui._run_elevated(
+            prefix + encode("$ErrorActionPreference='Stop'; throw 'boom-1234'"))
+        self.assertNotEqual(code, 0)
+        self.assertIn("boom-1234", out)
+
+    def test_runs_without_touching_the_program_directory(self):
+        missing = os.path.join(tempfile.gettempdir(), "campusnet-does-not-exist")
+        runtime_dir = Mock(return_value=missing)
+        with patch.object(app, "get_runtime_dir", runtime_dir):
+            code, _, out = self._ui()._run_elevated(
+                "powershell -NoProfile -Command Write-Output campusnet-ok")
+        self.assertEqual(code, 0, out)
+        self.assertIn("campusnet-ok", out)
+        runtime_dir.assert_not_called()
+
+    def test_exit_code_comes_from_the_child(self):
+        code, _, _ = self._ui()._run_elevated(
+            "powershell -NoProfile -Command exit 7")
+        self.assertEqual(code, 7)
+
+    def test_child_output_survives_the_console_codepage(self):
+        """子进程没有控制台，输出按哪个编码落盘由系统区域设置决定，不能读成乱码。"""
+        import ctypes
+        if ctypes.windll.kernel32.GetOEMCP() != 936:
+            self.skipTest("中文系统专用：中文输出在非中文代码页下会退化成 ?")
+        _, _, out = self._ui()._run_elevated(
+            "powershell -NoProfile -Command Write-Output 中文报错")
+        self.assertIn("中文报错", out)
+
+    def test_decode_prefers_utf8_then_falls_back(self):
+        import ctypes
+        import gui_app
+        text = "拒绝访问 (0x80070005)"
+        self.assertEqual(gui_app.decode_child_output(text.encode("utf-8")), text)
+        # cp936 是中文系统的 OEM 代码页，应当被第二轮接住；别的语言没这个代码页，
+        # 只要求它不抛异常。
+        if ctypes.windll.kernel32.GetOEMCP() == 936:
+            self.assertEqual(gui_app.decode_child_output(text.encode("cp936")), text)
+        self.assertEqual(gui_app.decode_child_output(b""), "")
+
 
 class GuiLogicTests(unittest.TestCase):
     """Only the pure translation layer — never instantiate a Tk window."""
@@ -446,6 +592,8 @@ class GuiLifecycleTests(unittest.TestCase):
         self.ui.mode_var = Mock()
         self.ui.mode_var.get.return_value = "silent"
         self.ui._config.update(silent_start_time="23:00", silent_run_minutes=30)
+        # _is_admin 必须为真：否则会走「先提权重开」的分支，在测试机上真弹 UAC
+        self.ui._is_admin = Mock(return_value=True)
         for name in ("_write_config", "_require_credentials", "_explain_elevation",
                      "_task_exists"):
             setattr(self.ui, name, Mock(return_value=True))
@@ -458,6 +606,81 @@ class GuiLifecycleTests(unittest.TestCase):
             self.ui._deploy_silent_task()
         success.assert_not_called()
         self.ui._report_task_failure.assert_called_once()
+
+    def _silent_deploy_stubs(self):
+        self.ui.mode_var = Mock()
+        self.ui.mode_var.get.return_value = "silent"
+        self.ui._config.update(silent_start_time="23:00", silent_run_minutes=30)
+        for name in ("_write_config", "_require_credentials", "_explain_elevation"):
+            setattr(self.ui, name, Mock(return_value=True))
+        self.ui.mode_note = Mock()
+        self.ui.root = Mock()
+        self.ui._task_register_command = Mock(return_value="command")
+        self.ui._run_elevated = Mock(return_value=(0, "command", ""))
+        self.ui._task_exists = Mock(return_value=True)
+
+    def test_non_admin_deploy_offers_elevated_restart_before_doing_anything(self):
+        """没提权就先别跑注册命令：那条路必定被拒，用户只会看到一句「失败了」。
+
+        回归守卫：旧流程是"就地跑一遍 → 拿到拒绝访问 → 再问要不要提权重开"，
+        而界面同时声称"接下来会弹出系统权限窗口"——那句话是假的：`_run_elevated()`
+        根本不会触发 UAC，只有 `_self_elevate()` 会。
+        """
+        self._silent_deploy_stubs()
+        self.ui._is_admin = Mock(return_value=False)
+        self.ui._self_elevate = Mock(return_value=True)
+        with patch.object(self.gui.messagebox, "askokcancel", return_value=True) as ask:
+            self.ui._deploy_silent_task()
+        ask.assert_called_once()
+        self.assertIn("UAC", ask.call_args[0][1])          # 提权窗口这次真的会来
+        self.ui._self_elevate.assert_called_once()
+        self.ui._run_elevated.assert_not_called()
+        self.ui._task_register_command.assert_not_called()
+
+    def test_non_admin_deploy_can_be_cancelled_without_side_effects(self):
+        self._silent_deploy_stubs()
+        self.ui._is_admin = Mock(return_value=False)
+        self.ui._self_elevate = Mock(return_value=False)
+        with patch.object(self.gui.messagebox, "askokcancel", return_value=False):
+            self.ui._deploy_silent_task()
+        self.ui._self_elevate.assert_not_called()
+        self.ui._run_elevated.assert_not_called()
+
+    def test_non_admin_remove_cannot_even_try_the_privileged_command(self):
+        """取消每天自动守护同样要提权：没提权就别去跑 Unregister-ScheduledTask。"""
+        self.ui.mode_note = Mock()
+        self.ui.root = Mock()
+        self.ui._task_exists = Mock(return_value=True)
+        self.ui._is_admin = Mock(return_value=False)
+        self.ui._self_elevate = Mock(return_value=True)
+        self.ui._run_elevated = Mock()
+        with patch.object(self.gui.messagebox, "askokcancel", return_value=True) as ask, \
+             patch.object(self.gui.messagebox, "askyesno") as confirm:
+            self.ui._remove_silent_task()
+        confirm.assert_not_called()
+        ask.assert_called_once()
+        self.ui._run_elevated.assert_not_called()
+        self.ui._self_elevate.assert_called_once()
+
+    def test_task_failure_detail_is_written_to_the_log_file(self):
+        """失败详情必须落盘到 logs\\：关掉窗口后，这行日志是唯一能要来排障的证据。
+
+        回归守卫：这里曾经用 self._log()，而它只往界面文本框里写、不落盘 ——
+        于是在别人电脑上，弹窗一关就什么证据都没了。
+        """
+        with tempfile.TemporaryDirectory() as run_dir, \
+             patch.object(app, "get_runtime_dir", return_value=run_dir), \
+             patch.object(self.gui.messagebox, "askyesno", return_value=False):
+            self.ui._report_task_failure("任务没有创建成功（脚本退出码 1）。",
+                                         "powershell -EncodedCommand xxx",
+                                         "拒绝访问 (0x80070005)")
+            log_dir = os.path.join(run_dir, "logs")
+            files = os.listdir(log_dir)
+            self.assertEqual(len(files), 1, files)
+            with open(os.path.join(log_dir, files[0]), encoding="utf-8") as f:
+                text = f.read()
+        self.assertIn("任务没有创建成功（脚本退出码 1）。", text)
+        self.assertIn("拒绝访问 (0x80070005)", text)
 
     def test_task_command_quotes_paths_and_checks_registered_settings(self):
         import base64
@@ -511,7 +734,7 @@ class ReleaseManifestTests(unittest.TestCase):
         import runpy
         import zipfile
         root = os.path.dirname(os.path.abspath(__file__))
-        with patch.object(sys, "argv", ["make_release_zip.py", "1.7.2"]):
+        with patch.object(sys, "argv", ["make_release_zip.py", "1.7.3"]):
             module = runpy.run_path(os.path.join(root, "packaging", "make_release_zip.py"))
         with tempfile.TemporaryDirectory() as staging:
             for src, _ in module["MANIFEST"]:
@@ -529,7 +752,7 @@ class ReleaseManifestTests(unittest.TestCase):
             module["main"].__globals__["ROOT"] = staging
             with contextlib.redirect_stdout(io.StringIO()):
                 module["main"]()
-            with zipfile.ZipFile(os.path.join(staging, "dist", "auto_login_v1.7.2.zip")) as z:
+            with zipfile.ZipFile(os.path.join(staging, "dist", "auto_login_v1.7.3.zip")) as z:
                 names = z.namelist()
             self.assertTrue(any(n.endswith("使用说明.txt") for n in names))
             self.assertFalse(any(n.endswith("auto_login_config.json") for n in names))

@@ -2,7 +2,7 @@
 
 ## 唯一日常使用入口
 
-`runtime/CampusNet/CampusNet.exe`：本机 v1.7.2 版本。双击打开界面。
+`runtime/CampusNet/CampusNet.exe`：本机部署版本（当前 v1.7.2）。双击打开界面。换新版只需用 `dist/CampusNet.exe` 覆盖它，账号配置和日志目录都保留。
 `runtime/CampusNet/auto_login_config.json`：实际账号及参数。
 `runtime/CampusNet/logs/`：当前运行日志。
 

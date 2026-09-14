@@ -1,6 +1,6 @@
 # Campus Network Auto-Login
 
-> **当前版本：v1.7.2** | 免费开源 | 仅供学习研究使用
+> **当前版本：v1.7.3** | 免费开源 | 仅供学习研究使用
 
 校园网断线自动认证工具。定时检测网络状态，检测到 captive portal 后通过后台 HTTP 请求静默完成认证，**完全无感**——不断网、不弹窗、不影响使用。
 
@@ -119,7 +119,15 @@ LICENSE                     # MIT 协议
 
 **方式 A：下载 exe（推荐，无需安装 Python）**
 
-从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.7.2.zip`，解压到任意文件夹（**注意整个文件夹一起解压，`assets` 子目录是图标，不能少**）。
+从 [Releases](https://github.com/suching8848/syxy_auto_verification/releases) 下载 `auto_login_v1.7.3.zip`，解压到任意文件夹（**注意整个文件夹一起解压，`assets` 子目录是图标，不能少**）。
+
+> **放在哪最好？** 程序放桌面也能用，但下面三种位置会让「每天自动守护」部署失败或到点不执行，排查起来还特别费劲：
+>
+> - **受控文件夹访问**（Windows 安全中心 → 勒索软件防护）默认保护「桌面 / 文档 / 图片 / 视频 / 音乐 / 收藏夹」，会拦住未签名程序往里写文件。v1.7.3 起程序会把临时文件和配置改存到 `%APPDATA%\CampusNet\` 并在日志里写明，但换个目录仍然最省事；
+> - **OneDrive 同步的桌面**：文件可能变成"仅联机可用"，程序被搬走或占位后计划任务就找不到它；
+> - **`Program Files`**：只读，配置写不进去。
+>
+> 推荐解压到 `D:\CampusNet\` 这类**纯英文短路径**（无空格、不同步、不受保护机制管）。
 
 **方式 B：运行 Python 脚本**
 
@@ -403,7 +411,7 @@ pyinstaller --onefile --console --name auto_login --specpath build auto_login.py
 > **为什么必须用 spec 文件而不是一行命令？** `CampusNet.spec` 里写死了
 > `console=False` 和图标路径。官方文档见 `docs/GUI_PLAN.md`。
 
-分发给别人需要的文件（已打包在 `auto_login_v1.7.2.zip`）：
+分发给别人需要的文件（已打包在 `auto_login_v1.7.3.zip`）：
 
 ```
 CampusNet.exe                   # 图形版主程序（双击即用，也支持 --silent）
@@ -411,7 +419,7 @@ assets\campusnet.ico            # 托盘/程序图标，必须和 exe 一起
 使用说明.txt                     # 三句话说清怎么用
 setup_task.ps1                  # 计划任务部署脚本（含 -Silent 静默模式）
 auto_login_config.example.json  # 配置模板（程序也会自己生成）
-RELEASE_v1.7.2.md               # 本版 Release 说明
+RELEASE_v1.7.3.md               # 本版 Release 说明
 ```
 
 对方解压后双击 `CampusNet.exe`：同目录会自动生成 `auto_login_config.json` 和 `logs\`，在「设置」页填好学号密码即可。
@@ -435,6 +443,14 @@ Start-Process chrome -ArgumentList "--auto-open-devtools-for-tabs", "http://www.
 5. 如果字段名或路径与默认的不同，需要修改脚本 `do_auth_portal_post()` 中的 form_data
 
 ## 版本历史
+
+### v1.7.3 (2026-09-14)
+
+- 修复「放在桌面的副本建不了每天自动守护，用管理员身份打开也没用」：不再往程序目录写注册任务的中转文件（受控文件夹访问会拦桌面/文档/图片），中转文件改到 `%TEMP%`，去掉 `.bat` 包装。
+- 提权流程改对了：非管理员时先以管理员身份重开自己（UAC 由那次启动真正触发）再去注册任务，不再出现"说要弹权限窗口、窗口没出现，然后失败"。
+- 程序目录写不进去时（受控文件夹访问 / 只读目录），配置与日志整体回退 `%APPDATA%\CampusNet`，读取也跟随那一份，界面会写明存到了哪里。
+- 计划任务失败详情用 `core.log()` 落盘到 `logs\`（此前只显示在界面上，关窗即丢）。
+- 54 项离线测试通过。**换程序目录后需要重新部署每天自动守护**。真机（开启受控文件夹访问的桌面）尚未复验，见 `RELEASE_v1.7.3.md` 的验证边界。
 
 ### v1.7.2 (2026-09-14)
 
@@ -566,6 +582,6 @@ python -m unittest -v test_auto_login
 - 每日静默任务由 Windows 决定启动时刻，启动参数包含 `--now`，避免再按配置时间等待。修改时间后请重新部署任务；已有任务也需重新部署才能使用此修复。
 - 手动守护持续运行，直到点击停止或退出。停止过程中需等当前网络请求结束，才可再次启动；旧线程消息不会覆盖新一轮状态。
 - GUI 部署会检查注册是否成功，并核对保存的程序路径、参数、工作目录和触发时间。每日守护时长必须是正整数。
-- 构建 `CampusNet.exe` 后，运行 `python packaging/make_release_zip.py 1.7.2` 生成白名单发布包；说明文件随源码维护。源码修改不会自动更新已有 exe。
+- 构建 `CampusNet.exe` 后，运行 `python packaging/make_release_zip.py 1.7.3` 生成白名单发布包；说明文件随源码维护。源码修改不会自动更新已有 exe。
 
 本机目录及实际运行入口参见 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)。

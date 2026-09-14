@@ -19,7 +19,7 @@ if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "v1.7.2"
+VERSION = "v1.7.3"
 
 # Required on Windows 11 for tray icon to appear — set before any window creation
 try:
@@ -52,6 +52,57 @@ def exe_dir():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+# 程序目录能不能写（进程内缓存）。get_log_path() 会经 get_runtime_dir() 频繁走到
+# 这里，所以探测结果必须缓存，不能每写一行日志就建删一次探针文件。
+_EXE_DIR_WRITABLE = None
+
+
+def _dir_writable(directory):
+    """能不能往 directory 里创建文件。
+
+    两种常见情况会让它为 False，而且都跟"权限不足"无关：
+
+    * Windows 的受控文件夹访问（勒索软件防护）会拦住未签名程序往「桌面 / 文档 /
+      图片 / 视频 / 音乐 / 收藏夹」这类受保护目录写文件 —— 而本程序经常就摆在
+      桌面上。管理员身份也拦，因为拦的是路径不是权限。
+    * 安装到只读目录（Program Files）时同理。
+
+    探针文件建完立刻删掉；建不了就说明写不进去。
+    """
+    probe = os.path.join(directory or ".", f".campusnet_probe_{os.getpid()}")
+    try:
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write("")
+    except OSError:
+        return False
+    try:
+        os.remove(probe)
+    except OSError:
+        pass
+    return True
+
+
+def _exe_dir_writable():
+    global _EXE_DIR_WRITABLE
+    if _EXE_DIR_WRITABLE is None:
+        _EXE_DIR_WRITABLE = _dir_writable(exe_dir())
+    return _EXE_DIR_WRITABLE
+
+
+def _reset_path_cache():
+    """Clear the cached writability probe. Tests only."""
+    global _EXE_DIR_WRITABLE, _RUNTIME_DIR
+    _EXE_DIR_WRITABLE = None
+    _RUNTIME_DIR = None
+
+
+def _appdata_config_path():
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    return os.path.join(appdata, "CampusNet", CONFIG_FILENAME)
+
+
 def find_config_file():
     """Locate auto_login_config.json.
 
@@ -61,27 +112,55 @@ def find_config_file():
     inherit one from %APPDATA% or from whoever's project happened to be the
     working directory.
 
-    %APPDATA% is only a last resort for the case where the program folder is not
-    writable (installed under Program Files); see config_write_path().
+    %APPDATA% is the fallback for the case where the program folder is not
+    writable: installed under Program Files, or sitting in a folder that Windows'
+    Controlled Folder Access protects (桌面/文档/图片…). It is consulted first in
+    that case — otherwise the program would write settings into %APPDATA% and
+    keep reading the stale file beside the exe, so the user's edits would look
+    like they never took effect. See config_write_path().
     """
     beside = os.path.join(exe_dir(), CONFIG_FILENAME)
+    installed = _appdata_config_path()
+    if installed and os.path.exists(installed) and not _exe_dir_writable():
+        return installed
     if os.path.exists(beside):
         return beside
     if not getattr(sys, "frozen", False) and os.path.exists(CONFIG_FILE):
         return CONFIG_FILE
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        installed = os.path.join(appdata, "CampusNet", CONFIG_FILENAME)
-        if os.path.exists(installed):
-            return installed
+    if installed and os.path.exists(installed):
+        return installed
     return beside
+
+
+# 日志/运行期文件放哪，同样进程内缓存：get_log_path() 每写一行日志都会问到它。
+_RUNTIME_DIR = None
 
 
 def get_runtime_dir():
     """Directory to keep logs in — beside the active config, so a portable
     folder stays self-contained and an installed copy never writes to a
-    read-only program directory."""
-    return os.path.dirname(find_config_file()) or SCRIPT_DIR
+    read-only program directory.
+
+    When that directory cannot be written to (Controlled Folder Access on the
+    Desktop, read-only install folder), logs go to %APPDATA%\\CampusNet instead.
+    Without this the silent guard would run every night and leave no trace at
+    all — and the log file is the only evidence silent mode ever produces.
+    """
+    global _RUNTIME_DIR
+    if _RUNTIME_DIR is None:
+        home = os.path.dirname(find_config_file()) or SCRIPT_DIR
+        if not _dir_writable(home):
+            installed = _appdata_config_path()
+            if installed:
+                candidate = os.path.dirname(installed)
+                try:
+                    os.makedirs(candidate, exist_ok=True)
+                except OSError:
+                    pass
+                if _dir_writable(candidate):
+                    home = candidate
+        _RUNTIME_DIR = home
+    return _RUNTIME_DIR
 
 DEFAULT_CONFIG = {
     "portal_url": "http://10.10.200.102",
@@ -187,33 +266,31 @@ def load_config():
 
 
 def config_write_path():
-    """Where to persist config on first run.
+    """Where to persist config on first run / on every save.
 
     Prefer the folder the user launched from, so a portable deployment stays
-    self-contained. Only fall back to %APPDATA% when that folder is not
-    writable (an installed copy under Program Files).
+    self-contained. Fall back to %APPDATA% when that folder is not writable —
+    an installed copy under Program Files, or a copy inside a folder that
+    Windows' Controlled Folder Access protects (桌面/文档/图片…). Note that the
+    check is on the *directory*, not on the file: a config that exists but sits
+    in an unwritable folder used to be returned as-is, and saving it then failed
+    with "写不进配置" even though %APPDATA% was available.
     """
-    existing = find_config_file()
-    if os.path.exists(existing):
-        return existing
     beside = os.path.join(exe_dir(), CONFIG_FILENAME)
-    try:
-        probe = beside + ".probe"
-        with open(probe, "w", encoding="utf-8") as f:
-            f.write("")
-        os.remove(probe)
+    existing = find_config_file()
+    if os.path.exists(existing) and _dir_writable(os.path.dirname(existing)):
+        return existing
+    if _exe_dir_writable():
         return beside
-    except OSError:
-        pass
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        target_dir = os.path.join(appdata, "CampusNet")
+    installed = _appdata_config_path()
+    if installed:
         try:
-            os.makedirs(target_dir, exist_ok=True)
-            return os.path.join(target_dir, CONFIG_FILENAME)
+            os.makedirs(os.path.dirname(installed), exist_ok=True)
         except OSError:
             pass
-    return beside
+        if _dir_writable(os.path.dirname(installed)):
+            return installed
+    return existing if os.path.exists(existing) else beside
 
 
 def save_config(config, path=None):
