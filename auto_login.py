@@ -1,6 +1,6 @@
 import urllib.request
 import urllib.error
-from urllib.parse import urlparse, urlencode, urljoin
+from urllib.parse import urlparse, urlsplit, urlencode, urljoin
 import http.cookiejar
 import webbrowser
 import json
@@ -348,6 +348,460 @@ def format_duration(seconds):
     return f"{h}h{m}m{s}s"
 
 
+# ── Attempt timing instrumentation (observation only) ────────────────────────
+#
+# Records how long each phase of one auth attempt took, so retry parameters can
+# be chosen from samples instead of guesses. A TimingRecord never influences a
+# decision: every field is written for logging only. Callers pass one in
+# optionally, so the existing boolean auth path is unchanged when it is absent.
+#
+# Two timing sources are deliberately kept apart:
+#   * `_now()` uses time.monotonic() — the only clock safe for intervals
+#     (wall time can jump when the network or clock changes).
+#   * the durations printed as ms derive from monotonic deltas.
+# This is wall-clock-agnostic and stays correct across DST/clock corrections.
+
+_METRIC_UNIT = "ms"
+
+
+def _now():
+    """Monotonic seconds — used for every interval in an attempt."""
+    return time.monotonic()
+
+
+# How many auth attempts are executing right now, in this process. Used only to
+# detect and report *overlapping* submissions (a GUI manual click racing the
+# detection loop); two simultaneous logins to one portal is a plausible way to
+# manufacture a session conflict, so the observation matters. This is a
+# reporting counter, not a lock — preventing the overlap is a later decision
+# that depends on what the samples show.
+_AUTH_IN_FLIGHT = 0
+_AUTH_IN_FLIGHT_LOCK = threading.Lock()
+
+
+def _metric_ms(started_at, finished_at):
+    """Milliseconds between two monotonic stamps; None when either is missing
+    or the result is negative (which can only happen with a broken clock)."""
+    if started_at is None or finished_at is None:
+        return None
+    delta = (finished_at - started_at) * 1000
+    return None if delta < 0 else delta
+
+
+def _fmt_metric(value, label=None):
+    """Render one metric for the log; None values simply disappear."""
+    if value is None:
+        return None
+    text = f"{value / 1000:.1f}s" if value >= 1000 else f"{value:.0f}ms"
+    return f"{label} {text}" if label else text
+
+
+def _timing_suffix(t):
+    """Compact per-phase summary appended to the existing Auth OK/FAIL line.
+
+    Returns "" when no record was supplied, so log lines produced by other
+    callers (tests, --auth) stay byte-identical to before. Phases are labelled
+    separately and never merged, so a reader can always tell where the time
+    went: discover = portal discovery/params, post = the credential POST,
+    verify = the post-auth connectivity check.
+    """
+    if t is None:
+        return ""
+    parts = []
+    for label, value in (("discover", t.discovery_ms),
+                         ("post", t.login_post_ms),
+                         ("verify", t.verify_ms),
+                         ("total", t.total_ms),
+                         ("unaccounted", t.unaccounted_ms)):
+        rendered = _fmt_metric(value, label)
+        if rendered:
+            parts.append(rendered)
+    if t.http_requests or t.socket_probes:
+        parts.append(f"http_requests={t.http_requests} socket_probes={t.socket_probes}")
+    return f" | {' '.join(parts)}" if parts else ""
+
+
+# ── Log redaction ────────────────────────────────────────────────────────────
+#
+# Portal responses are external input that routinely embeds session material:
+# the observed body carries a `userIndex` token, and a request/response can
+# carry a session id or a credential. Logs are shared for troubleshooting, so
+# anything that looks like a secret is masked before it is written, and the
+# raw body is never logged verbatim.
+
+_SECRET_KEYS = (
+    "password", "passwd", "pwd", "token", "secret", "sessionid", "session_id",
+    "jsessionid", "authorization", "userindex", "ticket", "validcode",
+    "querystring", "userId",
+    # Portal session parameters: these identify the client's session on the
+    # access controller and are bound into the login form, so they belong with
+    # the rest of the session material even though they are not credentials.
+    "wlanuserip", "wlanacname", "nasip", "wlanacip", "mac",
+)
+
+_REDACT_PATTERNS = (
+    # JSON form:  "password":"FAKE_SECRET"
+    (re.compile(
+        r'(?i)"(' + "|".join(_SECRET_KEYS) + r')"\s*:\s*"[^"]*"'),
+     r'"\1":"***"'),
+    # Form/query form:  password=FAKE_SECRET&token=FAKE_TOKEN
+    (re.compile(
+        r'(?i)\b(' + "|".join(_SECRET_KEYS) + r')\s*=\s*([^"\s&,;]+)'),
+     r'\1=***'),
+    # long opaque blobs: hex/base64-ish runs that are almost never diagnostics
+    (re.compile(r'\b[0-9a-fA-F]{24,}\b'), '***'),
+    (re.compile(r'\b[A-Za-z0-9+/]{32,}={0,2}\b'), '***'),
+)
+
+
+def redact_for_log(text, limit=200):
+    """Mask *recognised* secrets and bound the length of free-form text.
+
+    Defence in depth, NOT a guarantee: an unforeseen field name holding a short
+    opaque value (`{"accesstoken":"Ab3xK9mQ2pL7v"}`) passes straight through,
+    because a blacklist cannot know a name it has never seen and the value is
+    too short to look like an opaque blob. Measured, not assumed.
+
+    Therefore: never hand a raw network payload to this function. Values taken
+    from the network go through `describe_portal_body`, `url_for_log` or
+    `query_param_names`, which emit structure only. This function is for text
+    a human wrote (the portal's own error message) and for defence in depth on
+    paths that already avoid raw values.
+    """
+    if not isinstance(text, str):
+        return ""
+    cleaned = text.replace("\r", " ").replace("\n", " ").strip()
+    if not cleaned:
+        return ""
+    for pattern, replacement in _REDACT_PATTERNS:
+        cleaned = pattern.sub(replacement, cleaned)
+    if limit and len(cleaned) > limit:
+        cleaned = cleaned[:limit] + "..."
+    return cleaned
+
+
+def describe_portal_body(body):
+    """A log-safe one-liner describing a portal response.
+
+    Whitelist, not blacklist. Masking known secret *names* cannot work: a field
+    this code has never seen (`accesstoken`, a device fingerprint, the next
+    portal release's new token) is unknown by definition, and a short opaque
+    value slips past the long-blob rules too. Measured on a realistic token,
+    `{"accesstoken":"Ab3xK9mQ2pL7v"}` passed through unchanged.
+
+    So no network-sourced VALUE is ever emitted:
+      * the verdict and the portal's own message are allow-listed fields, and
+        the message still goes through the redaction pass;
+      * any other JSON field contributes only its NAME;
+      * a response that is not a JSON object contributes only its size.
+    The raw body is never included — a success response carries a session token
+    in `userIndex`, which would otherwise land in every log file.
+    """
+    if not body:
+        return "(empty)"
+    result, message = parse_portal_reply(body)
+    if message:
+        return f"result={result or '?'} msg={redact_for_log(message)}"
+    if result:
+        return f"result={result}"
+    return f"(unparsed {len(body)} bytes) {json_field_names(body)}"
+
+
+def json_field_names(body):
+    """The field names of a JSON-object body, or a size note for anything else.
+
+    Names are structural, never values, so this cannot echo a secret even when
+    the field is one nobody anticipated.
+    """
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return "non-JSON"
+    if not isinstance(parsed, dict):
+        return f"json {type(parsed).__name__}"
+    names = sorted(str(key) for key in parsed.keys())
+    if not names:
+        return "json object (no fields)"
+    return "fields " + ",".join(names[:12])
+
+
+def _safe_portal_message(value, limit=160):
+    """Backwards-compatible alias: redact + bound a single portal message."""
+    return redact_for_log(value, limit)
+
+
+# Portal discovery carries session material in its URLs and bodies just as the
+# login response does. Rather than masking known-bad names (which cannot cover
+# a field nobody anticipated), discovery logging emits structure only: URL
+# parameter names, and JSON field names — never a value taken from the network.
+def url_for_log(url):
+    """A portal URL reduced to the parts that are safe to keep.
+
+    The host and path identify the portal (already known from config); the query
+    string is where session material lives and where an unforeseen parameter
+    name would leak, so the values are never emitted. Parameter NAMES are kept,
+    which is what makes the line diagnostically useful.
+    """
+    if not isinstance(url, str) or not url:
+        return ""
+    split = urlsplit(url)
+    base = f"{split.scheme}://{split.netloc}{split.path}" if split.scheme else split.path
+    if not split.query:
+        return base
+    names = []
+    for pair in split.query.split("&"):
+        name = pair.split("=", 1)[0]
+        if name:
+            names.append(name)
+    return f"{base}?{','.join(names)}" if names else base
+
+
+def query_param_names(query_string):
+    """Only the parameter names of a form/query string, never the values.
+
+    Used where a query string is itself the diagnostic artefact (extracted
+    params, fallback queryString): seeing which parameters were recovered is
+    the useful part, and the values are exactly the session material that must
+    not be written down.
+    """
+    if not isinstance(query_string, str) or not query_string:
+        return "(none)"
+    names = [pair.split("=", 1)[0] for pair in query_string.split("&") if pair]
+    names = [name for name in names if name]
+    return ",".join(names) if names else "(none)"
+
+
+def body_for_log(body, limit=120):
+    """A response body as log-safe structure only (see describe_portal_body)."""
+    if not isinstance(body, str) or not body:
+        return "(empty)"
+    return f"({len(body)} bytes) {json_field_names(body)}"
+
+
+def parse_portal_reply(body):
+    """Extract (result, message) from a portal JSON body.
+
+    Pure and defensive: non-JSON, arrays, null and oversized messages all come
+    back as empty strings rather than raising. Stage A only records what the
+    portal said — classifying it into a failure kind is deliberately left to a
+    later step, so nothing here can steer a retry.
+    """
+    try:
+        parsed = json.loads(body)
+    except (ValueError, TypeError):
+        return "", ""
+    if not isinstance(parsed, dict):
+        return "", ""
+    result = parsed.get("result")
+    result_text = result if isinstance(result, str) else ""
+    return result_text[:32], _safe_portal_message(parsed.get("message"))
+
+
+class TimingRecord:
+    """Per-attempt phase timings plus the clue fields from the plan's A.5.
+
+    A.5 insists these are *clues*, never proof: a conflict on the first attempt
+    does not establish a portal-side leftover, and a conflict appearing only on
+    later attempts does not prove this tool created one. The fields below are
+    therefore stored verbatim and never turned into a verdict; any conclusion
+    has to come from correlating several independent samples.
+    """
+
+    __slots__ = (
+        "started_at", "discovery_finished_at", "login_started_at",
+        "login_finished_at", "verify_finished_at", "finished_at",
+        "http_requests", "socket_probes", "verify_attempts", "portal_http_status",
+        "portal_result", "portal_message",
+        "attempt_index", "overlapping_auth", "peer_device_state",
+        "retry_planned_wait_ms", "retry_lateness_ms",
+    )
+
+    def __init__(self):
+        self.started_at = _now()
+        self.discovery_finished_at = None
+        self.login_started_at = None
+        self.login_finished_at = None
+        self.verify_finished_at = None
+        self.finished_at = None
+        self.http_requests = 0
+        self.socket_probes = 0
+        self.verify_attempts = 0
+        self.portal_http_status = None
+        self.portal_result = ""
+        self.portal_message = ""
+        # ── A.5 clue fields ──
+        # Which attempt inside this outage this is (1 = the first one).
+        self.attempt_index = 0
+        # True when another auth was already in flight. Measured, not assumed:
+        # an overlapping submit is one of the few *definite* self-inflicted
+        # causes, so it must be observed rather than defaulted to False.
+        self.overlapping_auth = False
+        # User-supplied note about other devices on the same account. Usually
+        # empty: it depends on the user reporting it, so absences prove nothing.
+        self.peer_device_state = ""
+        # Scheduling quality: how long we planned to wait vs how late we were.
+        self.retry_planned_wait_ms = None
+        self.retry_lateness_ms = None
+
+    def count_request(self):
+        """Count one HTTP request actually issued for this attempt."""
+        self.http_requests += 1
+
+    def mark_discovery_done(self):
+        """Portal discovery, index.jsp and parameter completion are finished —
+        i.e. everything before the credential POST is built.
+
+        Must be called on every exit path, including failures, so the discovery
+        phase is always closed and never silently absorbs time that belongs to
+        a later phase.
+        """
+        self.discovery_finished_at = _now()
+
+    def reboot_timeline(self):
+        """Restart the phase timeline from now, discarding every stamp.
+
+        Called once the auth mutex has been acquired. `started_at` is set when
+        the record is constructed, which happens before the lock is taken, so
+        without this the brief wait for the mutex would be charged to discovery
+        and then reported again as unaccounted overhead. The mutex only guards a
+        counter, so that wait is not worth measuring on its own — restarting the
+        timeline is what keeps the phase numbers honest.
+        """
+        self.started_at = _now()
+        self.discovery_finished_at = None
+        self.login_started_at = None
+        self.login_finished_at = None
+        self.verify_finished_at = None
+        self.finished_at = None
+
+    def mark_login_started(self):
+        """The credential POST is about to be sent."""
+        self.login_started_at = _now()
+        if self.discovery_finished_at is None:
+            # Callers that skip explicit phase marks must not yield a bogus
+            # negative POST duration; treat the gap as discovery.
+            self.discovery_finished_at = self.login_started_at
+
+    def mark_login_done(self):
+        self.login_finished_at = _now()
+
+    def mark_verify_done(self):
+        self.verify_finished_at = _now()
+
+    def mark_due(self, scheduled_at, planned_wait_ms=None):
+        """Record how the retry schedule performed for this attempt.
+
+        `scheduled_at` is the monotonic deadline the loop planned to auth at;
+        `planned_wait_ms` is the interval it intended to wait. Keeping them
+        apart matters: a slipped deadline shows up as lateness, while a long
+        planned wait is a deliberate parameter — conflating the two would let a
+        scheduling bug masquerade as a conservative setting.
+        """
+        if planned_wait_ms is not None:
+            self.retry_planned_wait_ms = planned_wait_ms
+        # A falsy deadline means "no scheduled retry yet" — the first attempt of
+        # an outage starts with next_auth_at = 0.0, and measuring against that
+        # would report the machine's uptime as lateness. Only a real deadline
+        # says anything about scheduling quality.
+        if not scheduled_at:
+            return
+        self.retry_lateness_ms = max(0.0, (self.started_at - scheduled_at) * 1000)
+
+    def mark_finished(self):
+        self.finished_at = _now()
+
+    @property
+    def total_ms(self):
+        """Whole attempt, from record creation to the terminal mark.
+
+        Deliberately does NOT fall back to an earlier mark: a phase that never
+        ran must report None, not 0.0, so "not measured" and "instant" stay
+        distinguishable when the samples are reviewed. Every exit path is
+        responsible for calling mark_finished().
+        """
+        return _metric_ms(self.started_at, self.finished_at)
+
+    @property
+    def unaccounted_ms(self):
+        """Time inside total_ms that no named phase claims.
+
+        Kept explicit rather than folded into a phase: record construction, the
+        return trip out of do_auth and the final mark are real but tiny, and
+        making the residual visible is what keeps a future regression (a phase
+        whose boundary was forgotten) from hiding inside total_ms.
+
+        Returns None until the record is closed, so an open record never looks
+        like a perfectly accounted one.
+        """
+        total = self.total_ms
+        if total is None:
+            return None
+        measured = sum(value for value in
+                       (self.discovery_ms, self.login_post_ms, self.verify_ms)
+                       if value is not None)
+        return total - measured
+
+    @property
+    def discovery_ms(self):
+        """Portal discovery, index.jsp, the cookie exchange and parameter
+        completion — everything up to (not including) the credential POST.
+
+        Kept separate from login_post_ms because the existing AUTH log line only
+        reports the POST, which made the pre-POST work invisible; that invisible
+        part is what the 13s outages were actually spent on.
+        """
+        return _metric_ms(self.started_at, self.discovery_finished_at)
+
+    @property
+    def login_post_ms(self):
+        """The credential POST and its response read."""
+        return _metric_ms(self.login_started_at, self.login_finished_at)
+
+    @property
+    def verify_ms(self):
+        """Post-auth connectivity confirmation (empty when no POST succeeded)."""
+        if self.verify_finished_at is None:
+            return None
+        started = self.login_finished_at or self.started_at
+        return _metric_ms(started, self.verify_finished_at)
+
+    def clue_line(self):
+        """One log line of A.5 clue fields, or "" when there is nothing to say.
+
+        Deliberately reports raw observations ("attempt #2", "1.8s") instead of
+        any interpretation, because the plan forbids drawing a cause from these.
+        """
+        if self.attempt_index <= 0:
+            return ""
+        parts = [f"attempt #{self.attempt_index}"]
+        if self.portal_result or self.portal_message:
+            described = self.portal_message or self.portal_result
+            parts.append(f"portal={self.portal_result or '?'} msg={described}")
+        for label, value in (("discover", self.discovery_ms),
+                             ("post", self.login_post_ms),
+                             ("verify", self.verify_ms),
+                             ("total", self.total_ms),
+                             ("unaccounted", self.unaccounted_ms)):
+            rendered = _fmt_metric(value, label)
+            if rendered:
+                parts.append(rendered)
+        if self.verify_attempts:
+            parts.append(f"verify_attempts={self.verify_attempts}")
+        if self.http_requests or self.socket_probes:
+            parts.append(f"http_requests={self.http_requests} "
+                         f"socket_probes={self.socket_probes}")
+        if self.overlapping_auth:
+            parts.append("overlapping_auth=yes")
+        if self.peer_device_state:
+            parts.append(f"peer_devices={self.peer_device_state}")
+        if self.retry_planned_wait_ms is not None:
+            parts.append(f"planned_wait={_fmt_metric(self.retry_planned_wait_ms) or '-'}")
+        if self.retry_lateness_ms is not None:
+            parts.append(f"lateness={_fmt_metric(self.retry_lateness_ms) or '-'}")
+        return " | ".join(parts)
+
+
+
 def check_network(url, timeout, expected_body=None):
     """Returns (ok: bool, detail: str).
     Checks for captive portal via URL redirect AND response body content.
@@ -371,7 +825,11 @@ def check_network(url, timeout, expected_body=None):
             if final.hostname and expected.hostname and final.hostname != expected.hostname:
                 return False, f"portal redirect to {final.hostname}"
             if final_url != url:
-                return False, f"redirected to {final_url[:100]}"
+                # The detail text is printed by callers and shown in the GUI, and
+                # this URL is network-sourced: a portal redirect carries its
+                # query string (session parameters) with it. Parameter names are
+                # kept, values are not.
+                return False, f"redirected to {url_for_log(final_url)}"
         if expected_body:
             body = resp.read(102400).decode("utf-8", errors="ignore")
             if expected_body.lower() not in body.lower():
@@ -494,11 +952,14 @@ _user32.PostMessageW.restype = ctypes.c_int
 # ── End of Tray API definitions ─────────────────────────────────────────────
 
 
-def do_auth_portal_post(config):
+def do_auth_portal_post(config, timings=None):
     """POST-based campus portal auth.
     Step 0: try to trigger portal redirect by accessing check_url (full browser headers)
     Step 1: fallback — access portal index.jsp directly, then try API
     Step 2: POST credentials to InterFace.do?method=login
+
+    `timings` is an optional TimingRecord used purely for observation; passing
+    None keeps the original behaviour and log format exactly as before.
     """
     portal_host = config.get("portal_url", "")
     username = config.get("username", "")
@@ -515,11 +976,16 @@ def do_auth_portal_post(config):
         urllib.request.HTTPCookieProcessor(cj),
     )
 
+    def _count():
+        if timings is not None:
+            timings.count_request()
+
     index_url = None
 
     # Step 0: probe check_url — portal may respond with JS redirect containing index.jsp URL
     try:
         req = urllib.request.Request(check_url, headers=BROWSER_HEADERS)
+        _count()
         resp = opener.open(req, timeout=timeout)
         body_text = resp.read(204800).decode("utf-8", errors="ignore")
         final_url = resp.geturl()
@@ -527,13 +993,13 @@ def do_auth_portal_post(config):
         # check for HTTP redirect
         if final_url != check_url and "index.jsp" in final_url:
             index_url = final_url
-            log(f"Portal HTTP redirect: {index_url[:150]}...", "AUTH")
+            log(f"Portal HTTP redirect: {url_for_log(index_url)}", "AUTH")
         else:
             # check for JavaScript redirect: top.self.location.href='...index.jsp?...'
             m = re.search(r"location\.href\s*=\s*['\"]([^'\"]*index\.jsp[^'\"]*)", body_text)
             if m:
                 index_url = m.group(1)
-                log(f"Portal JS redirect: {index_url[:150]}...", "AUTH")
+                log(f"Portal JS redirect: {url_for_log(index_url)}", "AUTH")
     except Exception as e:
         log(f"Probe {check_url}: {e}", "AUTH")
 
@@ -547,20 +1013,26 @@ def do_auth_portal_post(config):
     index_body = ""
     try:
         req = urllib.request.Request(index_url, headers={"User-Agent": BROWSER_UA})
+        _count()
         resp = opener.open(req, timeout=timeout)
         index_body = resp.read(204800).decode("utf-8", errors="ignore")
         final_url = resp.geturl()
         if final_url != index_url:
             index_url = final_url
-            log(f"Portal responded with: {index_url[:150]}...", "AUTH")
+            log(f"Portal responded with: {url_for_log(index_url)}", "AUTH")
         # scan body for JS redirect (same as Step 0, but for index page)
         if not urlparse(index_url).query:
             m = re.search(r"location\.href\s*=\s*['\"]([^'\"]*index\.jsp[^'\"]*)", index_body)
             if m:
                 index_url = m.group(1)
-                log(f"Found JS redirect in index page: {index_url[:150]}...", "AUTH")
+                log(f"Found JS redirect in index page: {url_for_log(index_url)}", "AUTH")
     except Exception as e:
         log(f"Failed to fetch index page: {e}", "ERROR")
+        if timings is not None:
+            # Discovery aborted here, and it must still be closed: otherwise the
+            # phase would stay None and its elapsed time would be silently
+            # attributed to nothing (or, worse, counted again later).
+            timings.mark_discovery_done()
         return False
 
     # Step 1.5: if we still have no query params, try portal APIs to get them
@@ -574,14 +1046,15 @@ def do_auth_portal_post(config):
                     "User-Agent": BROWSER_UA,
                     "Referer": index_url,
                 })
+                _count()
                 resp = opener.open(req, timeout=timeout)
                 api_body = resp.read(204800).decode("utf-8", errors="ignore")
-                log(f"API {api_method} response: {api_body[:200]}", "AUTH")
+                log(f"API {api_method} response: {body_for_log(api_body)}", "AUTH")
                 final_url = resp.geturl()
                 if final_url != api_url and "index.jsp" in final_url:
                     index_url = final_url
                     query_string = urlparse(index_url).query
-                    log(f"Got redirect with params: {index_url[:150]}...", "AUTH")
+                    log(f"Got redirect with params: {url_for_log(index_url)}", "AUTH")
                     break
             except Exception as e:
                 log(f"API {api_method} failed: {e}", "AUTH")
@@ -593,14 +1066,14 @@ def do_auth_portal_post(config):
                             index_body, re.IGNORECASE)
         if params:
             query_string = "&".join(f"{k}={v}" for k, v in params)
-            log(f"Extracted params from page body: {query_string[:200]}", "AUTH")
+            log(f"Extracted params from page body: {query_param_names(query_string)}", "AUTH")
         else:
             # try JS vars: var wlanuserip = "10.1.2.3";
             js_params = re.findall(r'(?:var|let|const)\s+(wlan\w+|\w+ip|nas\w*|mac)\s*=\s*["\']([^"\']+)["\']',
                                    index_body, re.IGNORECASE)
             if js_params:
                 query_string = "&".join(f"{k}={v}" for k, v in js_params)
-                log(f"Extracted JS params from page body: {query_string[:200]}", "AUTH")
+                log(f"Extracted JS params from page body: {query_param_names(query_string)}", "AUTH")
 
     # Step 1.7: last resort — construct minimal queryString from local IP
     if not query_string:
@@ -612,10 +1085,17 @@ def do_auth_portal_post(config):
             s.connect((host, 80))
             local_ip = s.getsockname()[0]
             s.close()
+            if timings is not None:
+                # A raw socket probe, not an HTTP request: counted separately so
+                # the HTTP request count stays an honest number.
+                timings.socket_probes += 1
             query_string = f"wlanuserip={local_ip}"
-            log(f"Fallback queryString: {query_string}", "AUTH")
+            log(f"Fallback queryString: {query_param_names(query_string)}", "AUTH")
         except Exception as e:
             log(f"Could not construct queryString: {e}", "AUTH")
+
+    if timings is not None:
+        timings.mark_discovery_done()
 
     form_data = urlencode({
         "userId": username,
@@ -638,22 +1118,32 @@ def do_auth_portal_post(config):
             "Origin": portal_host,
             "User-Agent": BROWSER_UA,
         })
+        if timings is not None:
+            timings.mark_login_started()
+        _count()
         resp = opener.open(req, timeout=timeout)
         body = resp.read().decode("utf-8", errors="ignore")
         elapsed = (time.time() - start) * 1000
-        snippet = body[:200].replace("\n", " ").strip()
-        try:
-            result = json.loads(body)
-        except (ValueError, TypeError):
-            result = {}
-        if not isinstance(result, dict) or result.get("result") != "success":
-            log(f"Auth FAIL [HTTP {resp.status}, {elapsed:.0f}ms] body: {snippet}", "ERROR")
+        result_text, message_text = parse_portal_reply(body)
+        if timings is not None:
+            timings.mark_login_done()
+            timings.portal_http_status = resp.status
+            timings.portal_result = result_text
+            timings.portal_message = message_text
+        if not result_text or result_text != "success":
+            log(f"Auth FAIL [HTTP {resp.status}, {elapsed:.0f}ms]{_timing_suffix(timings)} "
+                f"body: {describe_portal_body(body)}", "ERROR")
             return False
-        log(f"Auth OK [HTTP {resp.status}, {elapsed:.0f}ms] body: {snippet}", "AUTH")
+        log(f"Auth OK [HTTP {resp.status}, {elapsed:.0f}ms]{_timing_suffix(timings)} "
+            f"body: {describe_portal_body(body)}", "AUTH")
         return True
     except Exception as e:
         elapsed = (time.time() - start) * 1000
-        log(f"Auth FAIL [{e}, {elapsed:.0f}ms]", "ERROR")
+        if timings is not None:
+            # No status/result exists for a transport-level failure, so the
+            # fields stay empty rather than being filled with a guess.
+            timings.mark_login_done()
+        log(f"Auth FAIL [{e}, {elapsed:.0f}ms]{_timing_suffix(timings)}", "ERROR")
         return False
 
 
@@ -668,7 +1158,7 @@ def do_auth_http(url, timeout):
         body = resp.read().decode("utf-8", errors="ignore")
         info = f"HTTP {resp.status}"
         if final_url != url:
-            info += f" (redirected to {final_url[:80]})"
+            info += f" (redirected to {url_for_log(final_url)})"
         return resp.status, body, info
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="ignore") if e.fp else ""
@@ -684,48 +1174,111 @@ def do_auth_browser(url, wait_seconds):
     simulate_enter()
 
 
-def do_auth(config, last_auth_time):
+def do_auth(config, last_auth_time, timings=None):
+    """Attempt authentication and confirm real connectivity.
+
+    Still returns a plain bool — every existing caller (CLI, GUI, tray) depends
+    on that, and a truthy non-bool would silently read as success. `timings` is
+    an optional TimingRecord filled in for observation only; it never changes
+    what happens.
+
+    The record is closed on every exit path, including the early returns, so a
+    failed attempt can never report total_ms = None (which would be
+    indistinguishable from "not measured").
+    """
     now = datetime.now()
     cooldown = config.get("auth_cooldown_seconds", 3)
     if last_auth_time and (now - last_auth_time).total_seconds() < cooldown:
         remaining = cooldown - int((now - last_auth_time).total_seconds())
         log(f"Auth cooldown ({remaining}s remaining), skip", "INFO")
+        if timings is not None:
+            # Skipped before doing anything: phases stay None, and the record is
+            # closed so total_ms is a real (tiny) number rather than missing.
+            timings.mark_finished()
         return False
 
     method = config.get("auth_method", "http")
     url = config.get("portal_url", "")
     timeout = config["request_timeout"]
 
+    # One attempt at a time inside this process. The GUI's manual-auth button
+    # can fire while the detection loop is mid-attempt, and two simultaneous
+    # submits to the portal is exactly the kind of overlap that can manufacture
+    # the session conflicts we are trying to measure. This is observation of
+    # the overlap (the counter is reported), not yet a prevention mechanism.
+    global _AUTH_IN_FLIGHT
+    with _AUTH_IN_FLIGHT_LOCK:
+        # The mutex guards only a counter, so its own wait is not a phase worth
+        # measuring. Restarting the timeline here keeps that brief wait out of
+        # discovery and out of the unaccounted residual.
+        if timings is not None:
+            timings.reboot_timeline()
+        _AUTH_IN_FLIGHT += 1
+        in_flight = _AUTH_IN_FLIGHT
+    try:
+        if timings is not None and in_flight > 1:
+            timings.overlapping_auth = True
+        return _do_auth_inner(config, method, url, timeout, timings)
+    finally:
+        with _AUTH_IN_FLIGHT_LOCK:
+            _AUTH_IN_FLIGHT -= 1
+        if timings is not None:
+            timings.mark_finished()
+
+
+def _do_auth_inner(config, method, url, timeout, timings):
+    """The original auth body, split out so do_auth can always close the record."""
     if method == "portal_post":
-        if not do_auth_portal_post(config):
+        if not do_auth_portal_post(config, timings):
             return False
     elif method == "browser":
         do_auth_browser(url, config.get("browser_wait_seconds", 3))
         log("Browser auth completed (Enter sent)", "AUTH")
     else:
         start = time.time()
+        if timings is not None:
+            timings.mark_login_started()
         status, body, info = do_auth_http(url, timeout)
         elapsed = (time.time() - start) * 1000
-        snippet = body[:200].replace("\n", " ").strip() if body else "(empty)"
+        if timings is not None:
+            timings.mark_login_done()
+            timings.portal_http_status = status
+        # Structural description, not a masked excerpt: http mode is just as
+        # likely to echo a session token, and a blacklist pass over a raw body
+        # cannot be trusted (a short unforeseen value slips through).
+        snippet = describe_portal_body(body)
         if status and 200 <= status < 300:
             body_lower = body.lower() if body else ""
             if "fail" in body_lower or "error" in body_lower:
-                log(f"Auth FAIL [{info}, {elapsed:.0f}ms] body: {snippet}", "ERROR")
+                log(f"Auth FAIL [{info}, {elapsed:.0f}ms]{_timing_suffix(timings)} "
+                    f"body: {snippet}", "ERROR")
                 return False
-            log(f"Auth OK [{info}, {elapsed:.0f}ms] body: {snippet}", "AUTH")
+            log(f"Auth OK [{info}, {elapsed:.0f}ms]{_timing_suffix(timings)} "
+                f"body: {snippet}", "AUTH")
             log("NOTE: http 模式无法100%确认认证成功，建议改用 portal_post 模式", "WARN")
         else:
-            log(f"Auth FAIL [{info}, {elapsed:.0f}ms]", "ERROR")
+            log(f"Auth FAIL [{info}, {elapsed:.0f}ms]{_timing_suffix(timings)}", "ERROR")
             return False
 
     # The portal response alone does not establish Internet connectivity.
     for attempt in range(3):
         if attempt:
             time.sleep(1)
+        if timings is not None:
+            timings.verify_attempts += 1
         ok, detail = check_network(config["check_url"], timeout,
                                    config.get("check_expected_body"))
         if ok:
+            if timings is not None:
+                timings.mark_verify_done()
+                timings.mark_finished()
             return True
+    if timings is not None:
+        # The portal accepted the credentials but connectivity still failed.
+        # Recorded so a "portal accepted / network not up" case is not confused
+        # with a rejected login when the samples are reviewed later.
+        timings.mark_verify_done()
+        timings.mark_finished()
     log(f"Auth response received but network is unavailable: {detail}", "ERROR")
     return False
 
@@ -1273,10 +1826,19 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
     total_checks = 0
     outage_checks = 0
     outage_start = None
+    # Wall-clock stamps are kept only for the log text the user reads; every
+    # interval below is measured on the monotonic clock so a clock correction
+    # (or a suspend/resume) cannot distort the numbers we will tune on.
+    first_failure_at = None
+    first_failure_monotonic = None
+    down_confirmed_monotonic = None
     auth_attempts = 0
     next_auth_at = 0.0
     auth_failures = 0
     was_down = False
+    # ── observation state (never feeds a decision) ──
+    last_probe_ms = None
+    planned_wait_ms = None
 
     while not (stop_event and stop_event.is_set()):
         try:
@@ -1285,26 +1847,58 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
                 break
 
             total_checks += 1
+            probe_started = _now()
             ok, detail = check_network(check_url, timeout, config.get("check_expected_body"))
+            last_probe_ms = _metric_ms(probe_started, _now())
 
             if ok:
                 if was_down and outage_start:
+                    # Outage length from DOWN confirmation (what the log has
+                    # always reported, kept for continuity).
                     duration = (datetime.now() - outage_start).total_seconds()
                     log(
                         f"Network restored — outage: {format_duration(duration)}, "
                         f"checks: {outage_checks}, auth_attempts: {auth_attempts}",
                         "RECOVER",
                     )
+                    # The window above starts when DOWN was confirmed, so it
+                    # under-reports what a user feels. The honest span starts at
+                    # the first failed probe; both are logged because they answer
+                    # different questions. Monotonic, so a clock correction
+                    # cannot change the number.
+                    if first_failure_monotonic is not None:
+                        observed = _now() - first_failure_monotonic
+                        confirmed = (down_confirmed_monotonic - first_failure_monotonic
+                                     if down_confirmed_monotonic is not None else 0.0)
+                        log(
+                            f"Recovery observed: {format_duration(observed)} from first "
+                            f"failed probe (DOWN confirmation added "
+                            f"{format_duration(max(0.0, confirmed))}, "
+                            f"auth_attempts {auth_attempts})",
+                            "RECOVER",
+                        )
                     was_down = False
                     outage_start = None
                     outage_checks = 0
                     auth_attempts = 0
+                # Cleared on EVERY success, not only at the end of a confirmed
+                # outage: a single failed probe followed by a healthy one must
+                # not leave a stale stamp behind, or a much later outage would
+                # inherit it and report a hugely inflated recovery time.
                 fail_count = 0
                 auth_failures = 0
+                first_failure_at = None
+                first_failure_monotonic = None
+                down_confirmed_monotonic = None
+                outage_start = None
+                planned_wait_ms = None
             else:
                 fail_count += 1
                 if not outage_start:
                     outage_start = datetime.now()
+                if first_failure_monotonic is None:
+                    first_failure_at = datetime.now()
+                    first_failure_monotonic = _now()
                 outage_checks += 1
 
                 if fail_count >= fail_threshold:
@@ -1313,14 +1907,30 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
                         log_failure_context(check_url, detail)
                         was_down = True
                         outage_start = datetime.now()
+                        down_confirmed_monotonic = _now()
+                        if first_failure_monotonic is not None:
+                            confirm_seconds = _now() - first_failure_monotonic
+                            log(
+                                f"Detection timing: first failure to DOWN confirmation "
+                                f"{format_duration(confirm_seconds)} (threshold "
+                                f"{fail_threshold}, last probe {_fmt_metric(last_probe_ms) or '-'})",
+                                "DOWN",
+                            )
                         outage_checks = 0
                         auth_attempts = 0
 
                     if time.monotonic() >= next_auth_at:
                         auth_attempts += 1
-                        authenticated = do_auth(config, None)
+                        timings = TimingRecord()
+                        timings.attempt_index = auth_attempts
+                        timings.mark_due(next_auth_at, planned_wait_ms)
+                        authenticated = do_auth(config, None, timings)
+                        clue = timings.clue_line()
+                        if clue:
+                            log(f"Attempt {auth_attempts} {clue}", "AUTH")
                         auth_failures = 0 if authenticated else auth_failures + 1
                         delay = auth_retry_delay(config, auth_failures)
+                        planned_wait_ms = delay * 1000
                         next_auth_at = time.monotonic() + delay
                     fail_count = 0
                 else:

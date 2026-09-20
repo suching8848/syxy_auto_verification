@@ -1,8 +1,10 @@
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta
 from unittest.mock import Mock, patch
@@ -159,6 +161,643 @@ class AutoLoginTests(unittest.TestCase):
                          [3, 5, 10, 20, 40, 80, 160, 300, 300])
         self.assertEqual(app.auth_retry_delay(self.config, 0), 3)
         self.assertEqual(app.auth_retry_delay(dict(self.config, auth_cooldown_seconds=30), 2), 30)
+
+
+class AttemptTimingTests(unittest.TestCase):
+    """Stage A is observation only: these timings must never steer a decision.
+
+    The tests therefore check two separate things — that the numbers are
+    correct, and that adding them left the auth path's behaviour and return
+    types untouched.
+    """
+
+    def setUp(self):
+        self.config = dict(app.DEFAULT_CONFIG, username="student", password="test")
+        self.log_patch = patch.object(app, "log")
+        self.log_patch.start()
+        self.addCleanup(self.log_patch.stop)
+        self.clock = [100.0]
+
+    def _advance(self, seconds):
+        self.clock[0] += seconds
+
+    def _record(self):
+        """A TimingRecord whose clock we control, so phase maths is exact."""
+        with patch.object(app.time, "monotonic", side_effect=lambda: self.clock[0]):
+            return app.TimingRecord()
+
+    def test_absent_record_leaves_log_lines_unchanged(self):
+        # Callers that pass no record (--auth, tests, older code) must keep
+        # producing exactly the previous log text.
+        self.assertEqual(app._timing_suffix(None), "")
+        empty = app.TimingRecord()
+        self.assertEqual(app._timing_suffix(empty), "")
+
+    def test_phase_metrics_are_exact(self):
+        # Three phases must stay separate: portal discovery/params, the
+        # credential POST, and the post-auth verification. Merging discovery
+        # with the POST would hide whichever half is actually slow.
+        with patch.object(app.time, "monotonic", side_effect=lambda: self.clock[0]):
+            t = app.TimingRecord()
+            self._advance(0.4)
+            t.mark_discovery_done()        # 发现 400ms
+            self._advance(0.2)
+            t.mark_login_started()         # POST 开始
+            self._advance(0.2)
+            t.mark_login_done()            # POST 200ms
+            self._advance(1.5)
+            t.mark_verify_done()
+            t.mark_finished()
+        self.assertAlmostEqual(t.discovery_ms, 400, delta=1)
+        self.assertAlmostEqual(t.login_post_ms, 200, delta=1)
+        self.assertAlmostEqual(t.verify_ms, 1500, delta=1)
+        self.assertAlmostEqual(t.total_ms, 2300, delta=1)
+        suffix = app._timing_suffix(t)
+        self.assertIn("discover 400ms", suffix)
+        self.assertIn("post 200ms", suffix)
+        self.assertIn("verify 1.5s", suffix)
+        self.assertIn("total 2.3s", suffix)
+
+    def test_login_post_ms_is_absent_when_the_post_never_started(self):
+        # Discovery failed before any POST: the POST phase is "not measured",
+        # which must not be reported as 0ms.
+        with patch.object(app.time, "monotonic", side_effect=lambda: self.clock[0]):
+            t = app.TimingRecord()
+            self._advance(0.3)
+            t.mark_discovery_done()
+            t.mark_finished()
+        self.assertAlmostEqual(t.discovery_ms, 300, delta=1)
+        self.assertIsNone(t.login_post_ms)
+
+    def test_login_started_defaults_the_discovery_boundary(self):
+        # A caller that only marks the POST must still yield a non-negative
+        # discovery phase rather than a negative one.
+        with patch.object(app.time, "monotonic", side_effect=lambda: self.clock[0]):
+            t = app.TimingRecord()
+            self._advance(0.25)
+            t.mark_login_started()
+            self._advance(0.1)
+            t.mark_login_done()
+        self.assertAlmostEqual(t.discovery_ms, 250, delta=1)
+        self.assertAlmostEqual(t.login_post_ms, 100, delta=1)
+
+    def test_total_ms_is_none_until_the_record_is_closed(self):
+        # "not measured" and "instant" must stay distinguishable.
+        with patch.object(app.time, "monotonic", side_effect=lambda: self.clock[0]):
+            t = app.TimingRecord()
+            t.mark_discovery_done()
+            self.assertIsNone(t.total_ms)
+            t.mark_finished()
+            self.assertEqual(t.total_ms, 0)
+
+    def test_verify_ms_is_absent_when_the_post_never_succeeded(self):
+        with patch.object(app.time, "monotonic", side_effect=lambda: self.clock[0]):
+            t = app.TimingRecord()
+            self._advance(0.3)
+            t.mark_discovery_done()
+            self._advance(0.1)
+            t.mark_login_started()
+            t.mark_login_done()
+            t.mark_finished()
+        self.assertIsNone(t.verify_ms)
+        self.assertIn("discover 300ms", app._timing_suffix(t))
+        self.assertIn("post 0ms", app._timing_suffix(t))
+
+    def test_lateness_is_separate_from_the_planned_wait(self):
+        # A long planned wait is a deliberate parameter; lateness is a
+        # scheduling defect. Conflating them would hide a slipped deadline.
+        with patch.object(app.time, "monotonic", side_effect=lambda: self.clock[0]):
+            t = app.TimingRecord()
+            t.mark_due(scheduled_at=self.clock[0] - 0.05, planned_wait_ms=250)
+        self.assertEqual(t.retry_planned_wait_ms, 250)
+        self.assertAlmostEqual(t.retry_lateness_ms, 50, delta=1)
+
+    def test_first_attempt_of_an_outage_reports_no_lateness(self):
+        # next_auth_at starts at 0.0, so measuring against it would report the
+        # machine's uptime (hours) as lateness and poison the sample.
+        with patch.object(app.time, "monotonic", side_effect=lambda: self.clock[0]):
+            t = app.TimingRecord()
+            t.mark_due(scheduled_at=0.0, planned_wait_ms=None)
+        self.assertIsNone(t.retry_lateness_ms)
+        self.assertNotIn("lateness=", t.clue_line())
+
+    def test_lateness_never_goes_negative_for_an_early_attempt(self):
+        with patch.object(app.time, "monotonic", side_effect=lambda: self.clock[0]):
+            t = app.TimingRecord()
+            t.mark_due(scheduled_at=self.clock[0] + 10, planned_wait_ms=1000)
+        self.assertEqual(t.retry_lateness_ms, 0)
+
+    def test_missing_stamps_yield_none_instead_of_zero(self):
+        t = app.TimingRecord()
+        self.assertIsNone(t.verify_ms)
+        self.assertEqual(app._metric_ms(None, None), None)
+
+    def test_fmt_metric_switches_unit_at_one_second(self):
+        self.assertEqual(app._fmt_metric(999), "999ms")
+        self.assertEqual(app._fmt_metric(1000), "1.0s")
+        self.assertEqual(app._fmt_metric(2540), "2.5s")
+        self.assertIsNone(app._fmt_metric(None))
+
+    def test_portal_message_is_bounded_and_flattened(self):
+        self.assertEqual(app._safe_portal_message(None), "")
+        self.assertEqual(app._safe_portal_message(123), "")
+        self.assertEqual(app._safe_portal_message("  a\nb  "), "a b")
+        # Long opaque runs are treated as secrets first, so the result is short;
+        # the important property is the bound, not the exact text.
+        self.assertLessEqual(len(app._safe_portal_message("x" * 500)), 163)
+
+    def test_long_diagnostic_text_is_truncated_not_masked(self):
+        # A genuinely long sentence must be truncated at the limit, otherwise
+        # the bound is untested for the realistic case.
+        message = ("运营商用户认证失败 " * 60).strip()
+        bounded = app._safe_portal_message(message, limit=160)
+        self.assertEqual(len(bounded), 163)
+        self.assertTrue(bounded.endswith("..."))
+        self.assertTrue(bounded.startswith("运营商用户认证失败"))
+
+    def test_redaction_masks_labelled_secrets(self):
+        cases = [
+            "password=FAKE_SECRET token=FAKE_TOKEN",
+            '{"password":"FAKE_SECRET","token":"FAKE_TOKEN"}',
+            "sessionId=FAKE_SESSION jsessionid=FAKE_JSESSION",
+            "userIndex=6632386361646666386164353832666639326137616365353931323434653332",
+        ]
+        for raw in cases:
+            with self.subTest(raw=raw):
+                cleaned = app.redact_for_log(raw)
+                self.assertNotIn("FAKE_SECRET", cleaned)
+                self.assertNotIn("FAKE_TOKEN", cleaned)
+                self.assertNotIn("FAKE_SESSION", cleaned)
+                self.assertNotIn("FAKE_JSESSION", cleaned)
+                self.assertNotIn("6632386361646666", cleaned)
+
+    def test_redaction_masks_unlabelled_opaque_blobs(self):
+        hex_blob = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+        self.assertNotIn(hex_blob, app.redact_for_log(f"index.jsp?wlan={hex_blob}"))
+        self.assertEqual(app.redact_for_log(None), "")
+        self.assertEqual(app.redact_for_log(42), "")
+
+    def test_redaction_keeps_the_diagnostic_part_intact(self):
+        # Over-redacting would make the logs useless for the analysis this work
+        # exists to enable, so the portal's own error text must survive.
+        message = ("运营商用户认证失败,失败原因[brac error: "
+                   "create session failed(mac collision)!]")
+        cleaned = app.redact_for_log(message)
+        self.assertIn("mac collision", cleaned)
+        self.assertIn("brac error", cleaned)
+
+    def test_describe_portal_body_never_echoes_session_material(self):
+        # The real success body carries a per-session userIndex token; logging
+        # it verbatim would put session material in every log file.
+        body = (b'{"userIndex":"6632386361646666386164353832666639326137616365353931'
+                b'3234346533325f31302e3135302e37342e31315f32333132353035303531",'
+                b'"result":"success","message":""}')
+        described = app.describe_portal_body(body)
+        self.assertNotIn("66323863", described)
+        self.assertIn("result=success", described)
+
+    def test_unknown_json_fields_contribute_names_only(self):
+        # A blacklist cannot cover a field nobody anticipated, so no value from
+        # the network is emitted at all — only the shape of the response.
+        # These short mixed-case tokens defeat both the name list and the
+        # opaque-blob length rules, which is exactly why the whitelist exists.
+        body = json.dumps({
+            "accesstoken": "Ab3xK9mQ2pL7v",
+            "deviceFingerprint": "Zq8Wn4Rt6Yu2",
+            "result": "",
+            "message": "",
+        }).encode()
+        described = app.describe_portal_body(body)
+        for secret in ("Ab3xK9mQ2pL7v", "Zq8Wn4Rt6yu2", "Zq8Wn4Rt6Yu2"):
+            self.assertNotIn(secret, described)
+        self.assertIn("accesstoken", described)
+        self.assertIn("deviceFingerprint", described)
+
+    def test_unparsed_body_contributes_neither_values_nor_text(self):
+        described = app.describe_portal_body(
+            b"<html>accesstoken=Ab3xK9mQ2pL7v</html>")
+        self.assertNotIn("Ab3xK9mQ2pL7v", described)
+        self.assertIn("non-JSON", described)
+        self.assertIn("bytes", described)
+
+    def test_json_array_body_reports_its_type_not_its_contents(self):
+        described = app.describe_portal_body(b'["Ab3xK9mQ2pL7v"]')
+        self.assertNotIn("Ab3xK9mQ2pL7v", described)
+        self.assertIn("json list", described)
+
+    def test_url_for_log_keeps_names_and_drops_values(self):
+        url = ("http://10.10.200.102/eportal/index.jsp?wlanuserip=Ab3xK9mQ2pL7v"
+               "&nasip=f28cadff&ssid=campus")
+        rendered = app.url_for_log(url)
+        self.assertIn("index.jsp", rendered)
+        self.assertIn("wlanuserip", rendered)
+        self.assertIn("nasip", rendered)
+        for secret in ("Ab3xK9mQ2pL7v", "f28cadff"):
+            self.assertNotIn(secret, rendered)
+        self.assertEqual(app.url_for_log(""), "")
+        self.assertEqual(app.url_for_log("http://h/p"), "http://h/p")
+
+    def test_query_param_names_reports_names_only(self):
+        rendered = app.query_param_names("wlanuserip=Ab3xK9mQ2pL7v&nasip=f28cadff")
+        self.assertEqual(rendered, "wlanuserip,nasip")
+        self.assertNotIn("Ab3xK9m", rendered)
+        self.assertEqual(app.query_param_names(""), "(none)")
+
+    def test_phase_buckets_never_exceed_the_total(self):
+        # The named phases measure disjoint intervals, so they can never add up
+        # to more than the whole attempt. This is a real assertion, unlike the
+        # earlier version which compared a sum against a total defined as that
+        # same sum (true by construction, so it could not fail).
+        with patch.object(app.time, "monotonic", side_effect=lambda: self.clock[0]):
+            t = app.TimingRecord()
+            self._advance(0.3)
+            t.mark_discovery_done()
+            self._advance(0.1)
+            t.mark_login_started()
+            self._advance(0.2)
+            t.mark_login_done()
+            self._advance(0.4)
+            t.mark_verify_done()
+            t.mark_finished()
+        phase_sum = t.discovery_ms + t.login_post_ms + t.verify_ms
+        self.assertLessEqual(phase_sum, t.total_ms + 0.001)
+        self.assertGreaterEqual(t.unaccounted_ms, -0.001)
+        self.assertAlmostEqual(t.unaccounted_ms, t.total_ms - phase_sum, delta=0.001)
+        suffix = app._timing_suffix(t)
+        self.assertIn("unaccounted", suffix)
+        # The lock is not a phase any more; its wait must not be reported.
+        self.assertNotIn("lock", suffix)
+
+    def test_concurrent_attempts_keep_the_accounting_sane(self):
+        """Two overlapping attempts must leave the counter clean and every
+        record measurable. Overlap detection itself is covered by the
+        dedicated overlapping_auth tests; this one is about the accounting
+        surviving concurrent use.
+        """
+        records = []
+        holding = threading.Event()
+        abort = threading.Event()
+
+        def slow(cfg, timings=None):
+            records.append(timings)
+            if len(records) == 1:
+                holding.set()
+                abort.wait(timeout=5)
+            return False
+
+        def run(record):
+            app.do_auth(self.config, None, record)
+
+        first, second = app.TimingRecord(), app.TimingRecord()
+        with patch.object(app, "do_auth_portal_post", side_effect=slow):
+            threads = [threading.Thread(target=run, args=(r,))
+                       for r in (first, second)]
+            threads[0].start()
+            self.assertTrue(holding.wait(timeout=5), "holder never entered")
+            threads[1].start()
+            time.sleep(0.02)
+            abort.set()
+            for thread in threads:
+                thread.join(timeout=10)
+
+        self.assertEqual(app._AUTH_IN_FLIGHT, 0)
+        for label, record in (("holder", first), ("waiter", second)):
+            with self.subTest(attempt=label):
+                self.assertIsNotNone(record.total_ms)
+                phase_sum = ((record.discovery_ms or 0) + (record.login_post_ms or 0)
+                             + (record.verify_ms or 0))
+                self.assertLessEqual(phase_sum, record.total_ms + 0.001)
+                self.assertGreaterEqual(record.unaccounted_ms, -0.001)
+
+    def test_lock_wait_is_not_a_reported_phase(self):
+        # The auth mutex guards only a counter, so its wait has no analytical
+        # value and must not appear as a phase. It is absorbed by the timeline
+        # reboot instead, which is why the residual stays tiny in normal runs.
+        self.assertFalse(hasattr(app.TimingRecord, "lock_wait_ms"))
+        self.assertNotIn("lock", app._timing_suffix(app.TimingRecord()))
+
+    def test_unaccounted_is_none_while_the_record_is_open(self):
+        self.assertIsNone(app.TimingRecord().unaccounted_ms)
+
+    def test_discovery_failure_still_closes_the_phase(self):
+        # If discovery aborts (index.jsp unreachable), the phase must still be
+        # closed — otherwise its elapsed time is reported as "not measured" and
+        # is silently attributed to nothing.
+        probe = Mock()
+        probe.geturl.return_value = self.config["check_url"]
+        probe.read.return_value = b"location.href='/eportal/index.jsp?wlanuserip=10.0.0.1'"
+        opener = Mock()
+        opener.open.side_effect = [probe, OSError("index.jsp unreachable")]
+        t = self._record()
+        with patch.object(app.urllib.request, "build_opener", return_value=opener):
+            ok = app.do_auth_portal_post(self.config, t)
+        self.assertFalse(ok)
+        self.assertIsNotNone(t.discovery_ms)
+        self.assertIsNone(t.login_post_ms)
+
+    def test_discovery_urls_are_redacted(self):
+        # index.jsp query strings carry wlanuserip/nasip session parameters, so
+        # every discovery log line has to go through the redaction too.
+        probe = Mock()
+        probe.geturl.return_value = self.config["check_url"]
+        probe.read.return_value = (
+            b"location.href='/eportal/index.jsp?wlanuserip=b1ec05a1192f2f949193"
+            b"c99f3e53a245&wlanacname=27dafb59c00c89cd&nasip=f28cadff8ad582ff'")
+        page = Mock()
+        page.geturl.return_value = (
+            self.config["portal_url"] + "/eportal/index.jsp?wlanuserip="
+            "b1ec05a1192f2f949193c99f3e53a245&nasip=f28cadff8ad582ff")
+        page.read.return_value = b""
+        result = Mock(status=200)
+        result.read.return_value = b'{"result":"fail","message":"nope"}'
+        opener = Mock()
+        opener.open.side_effect = [probe, page, result]
+        logged = []
+        with patch.object(app, "log", side_effect=lambda msg, level="INFO":
+                          logged.append(msg)), \
+             patch.object(app.urllib.request, "build_opener", return_value=opener):
+            app.do_auth_portal_post(self.config, app.TimingRecord())
+        joined = "\n".join(logged)
+        self.assertIn("Portal JS redirect", joined)
+        self.assertNotIn("b1ec05a1192f2f949193c99f3e53a245", joined)
+        self.assertNotIn("f28cadff8ad582ff", joined)
+        self.assertNotIn("27dafb59c00c89cd", joined)
+
+    def test_discovery_api_body_is_redacted(self):
+        # The device APIs echo session state; it must not be dumped verbatim.
+        probe = Mock()
+        probe.geturl.return_value = self.config["check_url"]
+        probe.read.return_value = b"location.href='/eportal/index.jsp'"
+        page = Mock()
+        page.geturl.return_value = self.config["portal_url"] + "/eportal/index.jsp"
+        page.read.return_value = b""
+        api = Mock()
+        api.geturl.return_value = self.config["portal_url"] + "/eportal/InterFace.do?method=pageInfo"
+        api.read.return_value = (b'{"userIndex":"66323863616466663861643538326666",'
+                                b'"token":"FAKE_TOKEN","service":"ok"}')
+        login = Mock(status=200)
+        login.read.return_value = b'{"result":"fail","message":"nope"}'
+        opener = Mock()
+        opener.open.side_effect = [probe, page, api, api, login]
+        logged = []
+        with patch.object(app, "log", side_effect=lambda msg, level="INFO":
+                          logged.append(msg)), \
+             patch.object(app.urllib.request, "build_opener", return_value=opener):
+            app.do_auth_portal_post(self.config, app.TimingRecord())
+        joined = "\n".join(logged)
+        self.assertNotIn("FAKE_TOKEN", joined)
+        self.assertNotIn("66323863616466663861643538326666", joined)
+
+    def test_overlapping_auth_is_measured_not_assumed(self):
+        # Two attempts in flight at once is a *definite* self-inflicted cause,
+        # so it has to be observed. A single attempt must not report it.
+        solo = app.TimingRecord()
+        with patch.object(app, "do_auth_portal_post", return_value=False):
+            app.do_auth(self.config, None, solo)
+        self.assertFalse(solo.overlapping_auth)
+
+    def test_two_concurrent_attempts_are_flagged_as_overlapping(self):
+        first = app.TimingRecord()
+        second = app.TimingRecord()
+        entered = threading.Barrier(2, timeout=5)
+
+        def slow_attempt(cfg, timings=None):
+            entered.wait()          # both attempts are now inside do_auth
+            return False
+
+        def run(record):
+            app.do_auth(self.config, None, record)
+
+        with patch.object(app, "do_auth_portal_post", side_effect=slow_attempt):
+            threads = [threading.Thread(target=run, args=(r,))
+                       for r in (first, second)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+        # The barrier guarantees both are inside do_auth before either reads the
+        # counter, so exactly one of them must observe the other.
+        self.assertTrue(first.overlapping_auth or second.overlapping_auth)
+        self.assertFalse(first.overlapping_auth and second.overlapping_auth)
+
+    def test_in_flight_counter_returns_to_zero_after_failures(self):
+        # A leaked counter would flag every later attempt as overlapping.
+        with patch.object(app, "do_auth_portal_post", return_value=False):
+            for _ in range(3):
+                app.do_auth(self.config, None, app.TimingRecord())
+        self.assertEqual(app._AUTH_IN_FLIGHT, 0)
+
+    def test_parse_portal_reply_handles_every_shape(self):
+        cases = [
+            (b'{"result":"success"}', ("success", "")),
+            (b'{"result":"fail","message":"mac collision"}', ("fail", "mac collision")),
+            (b"{}", ("", "")),
+            (b"[]", ("", "")),
+            (b"null", ("", "")),
+            (b"<html>not json</html>", ("", "")),
+            (b'{"result":123}', ("", "")),
+            (b'{"result":"fail","message":null}', ("fail", "")),
+        ]
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(app.parse_portal_reply(body), expected)
+
+    def test_clue_line_reports_observations_not_a_verdict(self):
+        with patch.object(app.time, "monotonic", side_effect=lambda: self.clock[0]):
+            t = app.TimingRecord()
+            t.attempt_index = 2
+            t.portal_result = "fail"
+            t.portal_message = "brac error: create session failed(mac collision)!"
+            t.http_requests = 3
+            t.socket_probes = 1
+            t.mark_due(scheduled_at=self.clock[0], planned_wait_ms=5000)
+            line = t.clue_line()
+        self.assertIn("attempt #2", line)
+        self.assertIn("portal=fail", line)
+        self.assertIn("mac collision", line)
+        self.assertIn("http_requests=3", line)
+        self.assertIn("socket_probes=1", line)
+        self.assertIn("planned_wait=5.0s", line)
+        # The plan forbids inferring a cause from these fields, so the line must
+        # not claim one. Guard the wording rather than trusting reviewers.
+        for forbidden in ("portal_side", "self_inflicted", "残留", "工具制造"):
+            self.assertNotIn(forbidden, line)
+
+    def test_clue_line_is_empty_before_an_attempt_is_numbered(self):
+        self.assertEqual(app.TimingRecord().clue_line(), "")
+
+    def test_portal_post_records_what_the_portal_said(self):
+        probe = Mock()
+        probe.geturl.return_value = self.config["check_url"]
+        probe.read.return_value = b"location.href='/eportal/index.jsp?wlanuserip=10.0.0.1'"
+        page = Mock()
+        page.geturl.return_value = self.config["portal_url"] + "/eportal/index.jsp?wlanuserip=10.0.0.1"
+        page.read.return_value = b""
+        result = Mock(status=200)
+        result.read.return_value = (b'{"result":"fail","message":"create session failed'
+                                    b'(mac collision)!"}')
+        opener = Mock()
+        opener.open.side_effect = [probe, page, result]
+        t = self._record()
+        with patch.object(app.urllib.request, "build_opener", return_value=opener):
+            with patch.object(app.urllib.request, "urlopen",
+                              side_effect=AssertionError("Unexpected network request")):
+                ok = app.do_auth_portal_post(self.config, t)
+        self.assertFalse(ok)
+        self.assertEqual(t.portal_result, "fail")
+        self.assertIn("mac collision", t.portal_message)
+        self.assertEqual(t.portal_http_status, 200)
+        self.assertEqual(t.http_requests, 3)
+        self.assertEqual(t.socket_probes, 0)
+
+    def test_instrumentation_keeps_do_auth_returning_a_plain_bool(self):
+        # A truthy tuple would read as success at every existing call site, so
+        # the observation hook must not change the return contract.
+        with patch.object(app, "do_auth_portal_post", return_value=True), \
+             patch.object(app, "check_network", return_value=(True, "OK")):
+            ok = app.do_auth(self.config, None, app.TimingRecord())
+        self.assertIs(type(ok), bool)
+        self.assertTrue(ok)
+        with patch.object(app, "do_auth_portal_post", return_value=False):
+            failed = app.do_auth(self.config, None, app.TimingRecord())
+        self.assertIs(type(failed), bool)
+        self.assertFalse(failed)
+
+    def test_verify_attempts_are_counted_per_confirmation_check(self):
+        t = app.TimingRecord()
+        with patch.object(app, "do_auth_portal_post", return_value=True), \
+             patch.object(app, "check_network",
+                          side_effect=[(False, "offline"), (False, "offline"), (True, "OK")]), \
+             patch.object(app.time, "sleep"):
+            self.assertTrue(app.do_auth(self.config, None, t))
+        self.assertEqual(t.verify_attempts, 3)
+        self.assertIsNotNone(t.verify_ms)
+
+    def test_detection_loop_emits_the_observation_line(self):
+        """End-to-end: a real outage must produce a machine-readable A.5 line.
+
+        The loop is driven with synthetic failures and a fast stop so the log
+        text itself can be asserted on — that text is the deliverable of
+        stage A, and a silent regression there would leave us sampling nothing.
+        """
+        lines = []
+        config = dict(self.config, check_interval_ok=0.01, check_interval_fail=0.01,
+                      run_duration_minutes=0)
+        stop = threading.Event()
+        attempts = []
+        real_sleep = app.time.sleep
+
+        def fake_sleep(seconds):
+            real_sleep(0.001)
+
+        def auth(cfg, last_auth_time, timings=None):
+            attempts.append(timings)
+            timings.mark_discovery_done()
+            timings.count_request()
+            timings.count_request()
+            timings.mark_login_done()
+            timings.portal_http_status = 200
+            timings.portal_result = "fail"
+            timings.portal_message = "create session failed(mac collision)!"
+            timings.verify_attempts = 1
+            timings.mark_verify_done()
+            timings.mark_finished()
+            if len(attempts) >= 2:
+                stop.set()
+            return False
+
+        with patch.object(app, "log", side_effect=lambda msg, level="INFO":
+                          lines.append(f"[{level}] {msg}")), \
+             patch.object(app, "check_network", return_value=(False, "portal injected")), \
+             patch.object(app, "do_auth", side_effect=auth), \
+             patch.object(app.time, "sleep", side_effect=fake_sleep):
+            app.run_detection_loop(config, stop_event=stop)
+
+        self.assertEqual(len(attempts), 2)
+        observation_lines = [line for line in lines if "[AUTH] Attempt " in line]
+        self.assertEqual(len(observation_lines), 2)
+        first = observation_lines[0]
+        self.assertIn("attempt #1", first)
+        self.assertIn("portal=fail", first)
+        self.assertIn("mac collision", first)
+        self.assertIn("total ", first)
+        self.assertIn("verify ", first)
+        self.assertIn("requests=2 socket_probes=0", first)
+        # The second attempt must show the interval the loop actually waited.
+        self.assertIn("planned_wait=3.0s", observation_lines[1])
+        # Clue text must describe, not conclude (see plan A.5).
+        self.assertNotIn("残留", first)
+        self.assertNotIn("self_inflicted", first)
+        # The detection-confirmation cost is now visible instead of implicit.
+        self.assertTrue(any("Detection timing:" in line for line in lines))
+
+    def test_single_transient_failure_does_not_poison_the_next_outage(self):
+        """A one-off failed probe must not become the start of a later outage.
+
+        Regression: clearing the first-failure stamp only at the end of a
+        *confirmed* outage left it behind after a lone failure, so a genuine
+        outage later on reported a recovery time inflated by the whole healthy
+        stretch in between — and those numbers are what the retry parameters get
+        tuned from.
+
+        A virtual clock is used so the healthy stretch is worth hundreds of
+        seconds: with the stamp leaking, the reported recovery time lands far
+        above the assertion below, so this test actually fails on the old
+        behaviour instead of merely documenting the new one.
+        """
+        lines = []
+        config = dict(self.config, check_interval_ok=0.05, check_interval_fail=0.05,
+                      run_duration_minutes=0)
+        stop = threading.Event()
+        # one blip -> a long healthy stretch -> a real outage -> recovery
+        outcomes = ([(False, "blip")] + [(True, "OK")] * 12
+                    + [(False, "portal injected")] * 2 + [(True, "OK")])
+        clock = [1000.0]
+        checks = [0]
+
+        def step():
+            clock[0] += 0.05
+            return clock[0]
+
+        def fake_check(url, timeout, expected=None):
+            # Hard cap so a regression can never spin this test forever: if the
+            # scenario is consumed the loop is stopped regardless, and the
+            # assertions below report the failure instead of hanging.
+            checks[0] += 1
+            if checks[0] > 60:
+                stop.set()
+                return True, "OK"
+            result = outcomes.pop(0) if outcomes else (True, "OK")
+            if not outcomes:
+                stop.set()
+            return result
+
+        def fake_auth(cfg, last_auth_time, timings=None):
+            timings.portal_result = "fail"
+            timings.portal_message = "create session failed(mac collision)!"
+            timings.mark_discovery_done()
+            timings.mark_finished()
+            return False
+
+        with patch.object(app, "log", side_effect=lambda msg, level="INFO":
+                          lines.append(f"[{level}] {msg}")), \
+             patch.object(app, "check_network", side_effect=fake_check), \
+             patch.object(app, "do_auth", side_effect=fake_auth), \
+             patch.object(app.time, "monotonic", side_effect=step), \
+             patch.object(app.time, "sleep", return_value=None):
+            app.run_detection_loop(config, stop_event=stop)
+
+        recovery = [line for line in lines if "Recovery observed:" in line]
+        self.assertEqual(len(recovery), 1, "expected exactly one confirmed outage")
+        match = re.search(r"Recovery observed: (\d+)s", recovery[0])
+        self.assertIsNotNone(match, recovery[0])
+        # The clock ticks 0.05s per call. The healthy stretch (12 valid probes
+        # plus their sleeps) spans >3.5 virtual seconds, while the outage that
+        # is actually measured spans about 1s. A leaked stamp therefore pushes
+        # this past the bound and FAILS the test, which is what makes it a real
+        # guard rather than a description of current behaviour.
+        self.assertLess(int(match.group(1)), 2, recovery[0])
 
 
 class SilentModeTests(unittest.TestCase):
