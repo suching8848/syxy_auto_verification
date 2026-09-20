@@ -19,7 +19,7 @@ if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "v1.7.6-observe"
+VERSION = "v1.7.6-observe+c395c4e"
 
 # Required on Windows 11 for tray icon to appear — set before any window creation
 try:
