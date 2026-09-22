@@ -2126,6 +2126,7 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
         log("Continuous mode", "INFO")
 
     fail_count = 0
+    confirm_count = 0
     total_checks = 0
     outage_checks = 0
     outage_start = None
@@ -2139,6 +2140,15 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
     next_auth_at = 0.0
     auth_failures = 0
     was_down = False
+    # ── retry state machine (plan §4.2) ──
+    # `backoff_step` is the regular backoff level, kept separate from
+    # `auth_failures` so a burst of fast retries cannot shove the backoff chain
+    # to its 300s cap. `first_conflict_at` opens the conflict fast-retry window;
+    # all three reset only when connectivity is actually confirmed.
+    retry_policy = RetryPolicy(config)
+    backoff_step = 1
+    fast_used = 0
+    first_conflict_at = None
     # ── observation state (never feeds a decision) ──
     last_probe_ms = None
     planned_wait_ms = None
@@ -2189,7 +2199,11 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
                 # not leave a stale stamp behind, or a much later outage would
                 # inherit it and report a hugely inflated recovery time.
                 fail_count = 0
+                confirm_count = 0
                 auth_failures = 0
+                backoff_step = 1
+                fast_used = 0
+                first_conflict_at = None
                 first_failure_at = None
                 first_failure_monotonic = None
                 down_confirmed_monotonic = None
@@ -2197,6 +2211,7 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
                 planned_wait_ms = None
             else:
                 fail_count += 1
+                confirm_count += 1
                 if not outage_start:
                     outage_start = datetime.now()
                 if first_failure_monotonic is None:
@@ -2204,8 +2219,12 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
                     first_failure_monotonic = _now()
                 outage_checks += 1
 
-                if fail_count >= fail_threshold:
-                    if not was_down:
+                # Confirmation is only needed to *enter* the down state. Once
+                # confirmed, a retry is scheduled by time alone: making each
+                # retry re-accumulate the threshold added a full probe interval
+                # of dead time per attempt (measured at 1.1-1.4s on 09-21).
+                if was_down or confirm_count >= fail_threshold:
+                    if confirm_count >= fail_threshold and not was_down:
                         log(f"Network DOWN (reason: {detail}), starting auth", "DOWN")
                         log_failure_context(check_url, detail)
                         was_down = True
@@ -2227,15 +2246,49 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
                         timings = TimingRecord()
                         timings.attempt_index = auth_attempts
                         timings.mark_due(next_auth_at, planned_wait_ms)
-                        authenticated = do_auth(config, None, timings)
+                        result_out = []
+                        authenticated = do_auth(config, None, timings, result_out)
+                        auth_result = result_out[0] if result_out else None
                         clue = timings.clue_line()
                         if clue:
                             log(f"Attempt {auth_attempts} {clue}", "AUTH")
-                        auth_failures = 0 if authenticated else auth_failures + 1
-                        delay = auth_retry_delay(config, auth_failures)
+
+                        # The retry state machine. Every failure advances the
+                        # regular backoff step, and only an explicitly enabled
+                        # policy can turn a session conflict into a short wait.
+                        if authenticated:
+                            auth_failures = 0
+                            backoff_step = 1
+                            fast_used = 0
+                            first_conflict_at = None
+                            delay = auth_retry_delay(config, 1)
+                            reason = "success"
+                        else:
+                            auth_failures += 1
+                            kind = (auth_result.kind if auth_result is not None
+                                    else RESULT_UNKNOWN)
+                            if kind == RESULT_SESSION_CONFLICT:
+                                if first_conflict_at is None:
+                                    first_conflict_at = time.monotonic()
+                                elapsed = time.monotonic() - first_conflict_at
+                            else:
+                                elapsed = None
+                            decision = retry_policy.decide(
+                                auth_result if auth_result is not None
+                                else AuthResult(False, RESULT_UNKNOWN),
+                                backoff_step, fast_used, elapsed)
+                            delay = decision.delay
+                            reason = decision.reason
+                            if decision.fast_used:
+                                fast_used = decision.fast_used
+                            else:
+                                # Only a regular-backoff decision advances the
+                                # chain; a fast retry deliberately does not, so
+                                # a burst of them cannot reach the 300s cap.
+                                backoff_step += 1
+                        log(f"Retry in {delay}s ({reason})", "AUTH")
                         planned_wait_ms = delay * 1000
                         next_auth_at = time.monotonic() + delay
-                    fail_count = 0
                 else:
                     log(f"Check #{fail_count} failed: {detail}", "WARN")
 

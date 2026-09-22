@@ -181,29 +181,164 @@ class AutoLoginTests(unittest.TestCase):
             post.assert_called_once_with(123, app.WM_USER + 2, 0, 0)
 
     def test_failed_auth_backoff_and_fast_confirmation(self):
+        # The retry schedule is the whole point of the state machine, so it is
+        # driven by a virtual clock: real time would make this test both slow
+        # and flaky, and the loop would spin because `next_auth_at` is compared
+        # against that same clock.
         stop = threading.Event()
         clock = [0.0]
         attempts = []
-        sleeps = []
+
         def sleep(seconds):
-            sleeps.append(seconds)
             clock[0] += seconds
-            if clock[0] >= 100:
-                stop.set()
-        def auth(*args):
+
+        def auth(config, last_auth_time, timings=None, result_out=None):
             attempts.append(clock[0])
+            if len(attempts) >= 6:
+                # Hard cap: a regression that retried without bound must fail an
+                # assertion below, never hang the suite.
+                stop.set()
+            # An unclassifiable failure takes the regular backoff.
+            return app.RESULT_UNKNOWN
+
+        def fake_do_auth(config, last_auth_time, timings=None, result_out=None):
+            kind = auth(config, last_auth_time, timings, result_out)
+            if result_out is not None:
+                result_out.append(app.AuthResult(False, kind))
             return False
+
         with patch.object(app, "check_network", return_value=(False, "offline")), \
-             patch.object(app, "do_auth", side_effect=auth), \
+             patch.object(app, "do_auth", side_effect=fake_do_auth), \
              patch.object(app.time, "monotonic", side_effect=lambda: clock[0]), \
              patch.object(app.time, "sleep", side_effect=sleep):
             app.run_detection_loop(self.config, stop_event=stop)
+
+        # First attempt lands right after the down state is confirmed (the
+        # threshold is still required to *enter* it).
         self.assertEqual(attempts[0], 2)
         self.assertEqual(len(attempts), 6)
         for index, delay in enumerate((3, 5, 10, 20, 40), start=1):
             elapsed = attempts[index] - attempts[index - 1]
             self.assertGreaterEqual(elapsed, delay)
-            self.assertLess(elapsed, delay + 4)
+            self.assertLess(elapsed, delay + 2)
+
+    def test_confirmed_outage_retries_on_schedule_without_re_confirming(self):
+        """Once down, the next attempt is due by time alone.
+
+        Regression for a measured cost: re-accumulating fail_threshold before
+        every retry added a full probe interval of dead time per attempt, which
+        the 09-21 sample showed as 1.1-1.4s of avoidable delay.
+        """
+        stop = threading.Event()
+        clock = [0.0]
+        attempts = []
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        def fake_do_auth(config, last_auth_time, timings=None, result_out=None):
+            attempts.append(clock[0])
+            if len(attempts) >= 4:
+                stop.set()
+            if result_out is not None:
+                result_out.append(app.AuthResult(False, app.RESULT_UNKNOWN))
+            return False
+
+        with patch.object(app, "check_network", return_value=(False, "offline")), \
+             patch.object(app, "do_auth", side_effect=fake_do_auth), \
+             patch.object(app.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(app.time, "sleep", side_effect=sleep):
+            app.run_detection_loop(self.config, stop_event=stop)
+
+        # With threshold=2 and interval_fail=1 the old code needed t=2, 8, 16...
+        # The gaps here are the planned backoff plus at most one probe interval.
+        gaps = [attempts[i] - attempts[i - 1] for i in range(1, len(attempts))]
+        for gap, expected in zip(gaps, (3, 5, 10)):
+            self.assertLess(gap, expected + 2, f"extra dead time before a retry: {gaps}")
+
+    def test_disabled_fast_path_keeps_the_regular_backoff_for_conflicts(self):
+        # Default configuration: even a clear session conflict must take the
+        # regular chain, because the fast path is a candidate, not a default.
+        stop = threading.Event()
+        clock = [0.0]
+        attempts = []
+        lines = []
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        def fake_do_auth(config, last_auth_time, timings=None, result_out=None):
+            attempts.append(clock[0])
+            if len(attempts) >= 3:
+                stop.set()
+            if result_out is not None:
+                result_out.append(app.AuthResult(
+                    False, app.RESULT_SESSION_CONFLICT,
+                    portal_message="create session failed(mac collision)!"))
+            return False
+
+        with patch.object(app, "log", side_effect=lambda msg, level="INFO":
+                          lines.append(msg)), \
+             patch.object(app, "check_network", return_value=(False, "offline")), \
+             patch.object(app, "do_auth", side_effect=fake_do_auth), \
+             patch.object(app.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(app.time, "sleep", side_effect=sleep):
+            app.run_detection_loop(dict(self.config), stop_event=stop)
+
+        delays = [clock_value - attempts[i - 1]
+                  for i, clock_value in enumerate(attempts) if i]
+        self.assertTrue(all(d >= 3 for d in delays), f"conflict took a short path: {delays}")
+        self.assertTrue(any("fast path is disabled" in line for line in lines),
+                        "the log must say why the conflict did not go fast")
+
+    def test_enabled_fast_path_retries_a_conflict_within_the_window(self):
+        # Explicitly enabled: the first conflict retries in a second, and the
+        # budget is bounded by the window rather than continuing forever.
+        config = dict(self.config, auth_conflict_fast_enabled=True,
+                      auth_conflict_retry_seconds=1,
+                      auth_conflict_max_fast_retries=15,
+                      auth_conflict_fast_window_seconds=25)
+        stop = threading.Event()
+        clock = [0.0]
+        attempts = []
+        lines = []
+
+        def sleep(seconds):
+            clock[0] += seconds
+
+        def fake_do_auth(cfg, last_auth_time, timings=None, result_out=None):
+            attempts.append(clock[0])
+            if len(attempts) >= 40:
+                stop.set()
+            if result_out is not None:
+                result_out.append(app.AuthResult(
+                    False, app.RESULT_SESSION_CONFLICT,
+                    portal_message="create session failed(mac collision)!"))
+            return False
+
+        with patch.object(app, "log", side_effect=lambda msg, level="INFO":
+                          lines.append(msg)), \
+             patch.object(app, "check_network", return_value=(False, "offline")), \
+             patch.object(app, "do_auth", side_effect=fake_do_auth), \
+             patch.object(app.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(app.time, "sleep", side_effect=sleep):
+            app.run_detection_loop(config, stop_event=stop)
+
+        fast_lines = [line for line in lines if "fast retry" in line]
+        self.assertTrue(fast_lines, "no fast retry was scheduled despite enabling it")
+        # First retry is a fast one, so the gap is far below the 3s backoff.
+        self.assertLess(attempts[1] - attempts[0], 3)
+        # Bounded by the policy's own budget, never an unbounded stream: probe
+        # intervals consume part of the window, so the count lands at or below
+        # the configured maximum.
+        self.assertLessEqual(len(fast_lines), config["auth_conflict_max_fast_retries"],
+                             "fast retries exceeded the configured budget")
+        # ... and past the window the chain resumes, which the log must say.
+        self.assertTrue(any("window closed" in line or "budget spent" in line
+                            for line in lines),
+                        "the fast window must close and hand over to the backoff")
+        self.assertTrue(any("regular backoff" in line for line in lines))
+        self.assertTrue(stop.is_set(), "the loop did not stop at the cap")
 
     def test_retry_delay_progression_and_cap(self):
         self.assertEqual([app.auth_retry_delay(self.config, n) for n in range(1, 10)],
@@ -746,7 +881,7 @@ class AttemptTimingTests(unittest.TestCase):
         def fake_sleep(seconds):
             real_sleep(0.001)
 
-        def auth(cfg, last_auth_time, timings=None):
+        def auth(cfg, last_auth_time, timings=None, result_out=None):
             attempts.append(timings)
             timings.mark_discovery_done()
             timings.count_request()
@@ -758,6 +893,11 @@ class AttemptTimingTests(unittest.TestCase):
             timings.verify_attempts = 1
             timings.mark_verify_done()
             timings.mark_finished()
+            if result_out is not None:
+                result_out.append(app.AuthResult(
+                    False, app.RESULT_SESSION_CONFLICT,
+                    portal_result="fail",
+                    portal_message="create session failed(mac collision)!"))
             if len(attempts) >= 2:
                 stop.set()
             return False
@@ -828,11 +968,15 @@ class AttemptTimingTests(unittest.TestCase):
                 stop.set()
             return result
 
-        def fake_auth(cfg, last_auth_time, timings=None):
+        def fake_auth(cfg, last_auth_time, timings=None, result_out=None):
             timings.portal_result = "fail"
             timings.portal_message = "create session failed(mac collision)!"
             timings.mark_discovery_done()
             timings.mark_finished()
+            if result_out is not None:
+                result_out.append(app.AuthResult(
+                    False, app.RESULT_SESSION_CONFLICT,
+                    portal_message="create session failed(mac collision)!"))
             return False
 
         with patch.object(app, "log", side_effect=lambda msg, level="INFO":
