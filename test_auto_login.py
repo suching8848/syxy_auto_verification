@@ -12,6 +12,17 @@ from unittest.mock import Mock, patch
 import auto_login as app
 
 
+def portal_post_result(ok, kind=None, message=""):
+    """Stub value for do_auth_portal_post, matching its (ok, AuthResult) shape.
+
+    Kept in one place so a future signature change is a single edit rather than
+    a dozen inconsistent test doubles.
+    """
+    if kind is None:
+        kind = app.RESULT_UNKNOWN if ok else app.RESULT_SESSION_CONFLICT
+    return ok, app.AuthResult(ok, kind, portal_message=message)
+
+
 class AutoLoginTests(unittest.TestCase):
     def setUp(self):
         self.config = dict(app.DEFAULT_CONFIG, username="student", password="test")
@@ -35,14 +46,40 @@ class AutoLoginTests(unittest.TestCase):
         opener = Mock()
         opener.open.side_effect = [probe, page, result]
         with patch.object(app.urllib.request, "build_opener", return_value=opener):
-            ok = app.do_auth_portal_post(self.config)
+            ok, _result = app.do_auth_portal_post(self.config)
         return ok, opener
 
     def test_portal_requires_explicit_success(self):
+        # do_auth_portal_post now reports (ok, AuthResult). The boolean half must
+        # keep its old meaning exactly — note the trap this signature avoids: a
+        # two-element tuple is ALWAYS truthy, so `if do_auth_portal_post(...)`
+        # would silently read as success. Every caller unpacks instead.
         for body in (b'{"result": "fail"}', b'{}', b'[]', b'null', b'<html>Error</html>'):
             with self.subTest(body=body):
                 self.assertFalse(self.portal_response(body)[0])
         self.assertTrue(self.portal_response(b'{"result": "success"}')[0])
+
+    def test_success_result_does_not_carry_the_session_token(self):
+        # The real success body contains a userIndex session token. It may reach
+        # the result object, but no rendering of that result may include it.
+        token = ("6632386361646666386164353832666639326137616365353931323434653332"
+                 "5f31302e3135302e37342e31315f32333132353035303531")
+        probe = Mock()
+        probe.geturl.return_value = self.config["check_url"]
+        probe.read.return_value = b"location.href='/eportal/index.jsp?wlanuserip=10.0.0.1'"
+        page = Mock()
+        page.geturl.return_value = self.config["portal_url"] + "/eportal/index.jsp?wlanuserip=10.0.0.1"
+        page.read.return_value = b""
+        result_resp = Mock(status=200)
+        result_resp.read.return_value = (
+            '{"userIndex":"%s","result":"success","message":""}' % token).encode()
+        opener = Mock()
+        opener.open.side_effect = [probe, page, result_resp]
+        with patch.object(app.urllib.request, "build_opener", return_value=opener):
+            ok, result = app.do_auth_portal_post(self.config)
+        self.assertTrue(ok)
+        self.assertNotIn("66323863", result.describe())
+        self.assertNotIn(token, repr(result))
 
     def test_relative_redirect_resolved(self):
         _, opener = self.portal_response(b'{"result":"success"}')
@@ -55,13 +92,25 @@ class AutoLoginTests(unittest.TestCase):
                              for c in opener.open.call_args_list))
 
     def test_auth_requires_network_recovery(self):
-        with patch.object(app, "do_auth_portal_post", return_value=True), \
+        with patch.object(app, "do_auth_portal_post", return_value=portal_post_result(True)), \
              patch.object(app, "check_network", return_value=(False, "offline")), \
              patch.object(app.time, "sleep"):
             self.assertFalse(app.do_auth(self.config, None))
 
+    def test_portal_success_but_no_connectivity_is_verification_failed(self):
+        # The portal accepted the credentials yet the network stayed down: its
+        # own class, not a rejected login, because retrying the login is not
+        # what would fix it.
+        result_out = []
+        with patch.object(app, "do_auth_portal_post", return_value=portal_post_result(True)), \
+             patch.object(app, "check_network", return_value=(False, "offline")), \
+             patch.object(app.time, "sleep"):
+            ok = app.do_auth(self.config, None, None, result_out)
+        self.assertFalse(ok)
+        self.assertEqual(result_out[0].kind, app.RESULT_VERIFICATION_FAILED)
+
     def test_delayed_network_recovery(self):
-        with patch.object(app, "do_auth_portal_post", return_value=True), \
+        with patch.object(app, "do_auth_portal_post", return_value=portal_post_result(True)), \
              patch.object(app, "check_network", side_effect=[(False, "offline"), (True, "OK")]), \
              patch.object(app.time, "sleep"):
             self.assertTrue(app.do_auth(self.config, None))
@@ -443,7 +492,7 @@ class AttemptTimingTests(unittest.TestCase):
             if len(records) == 1:
                 holding.set()
                 abort.wait(timeout=5)
-            return False
+            return portal_post_result(False)
 
         def run(record):
             app.do_auth(self.config, None, record)
@@ -490,10 +539,13 @@ class AttemptTimingTests(unittest.TestCase):
         opener.open.side_effect = [probe, OSError("index.jsp unreachable")]
         t = self._record()
         with patch.object(app.urllib.request, "build_opener", return_value=opener):
-            ok = app.do_auth_portal_post(self.config, t)
+            ok, result = app.do_auth_portal_post(self.config, t)
         self.assertFalse(ok)
         self.assertIsNotNone(t.discovery_ms)
         self.assertIsNone(t.login_post_ms)
+        # An unreachable index page is a network problem, never a conflict, so it
+        # can never enter the conflict fast path.
+        self.assertEqual(result.kind, app.RESULT_NETWORK_ERROR)
 
     def test_discovery_urls_are_redacted(self):
         # index.jsp query strings carry wlanuserip/nasip session parameters, so
@@ -552,7 +604,7 @@ class AttemptTimingTests(unittest.TestCase):
         # Two attempts in flight at once is a *definite* self-inflicted cause,
         # so it has to be observed. A single attempt must not report it.
         solo = app.TimingRecord()
-        with patch.object(app, "do_auth_portal_post", return_value=False):
+        with patch.object(app, "do_auth_portal_post", return_value=portal_post_result(False)):
             app.do_auth(self.config, None, solo)
         self.assertFalse(solo.overlapping_auth)
 
@@ -563,7 +615,7 @@ class AttemptTimingTests(unittest.TestCase):
 
         def slow_attempt(cfg, timings=None):
             entered.wait()          # both attempts are now inside do_auth
-            return False
+            return portal_post_result(False)
 
         def run(record):
             app.do_auth(self.config, None, record)
@@ -583,7 +635,7 @@ class AttemptTimingTests(unittest.TestCase):
 
     def test_in_flight_counter_returns_to_zero_after_failures(self):
         # A leaked counter would flag every later attempt as overlapping.
-        with patch.object(app, "do_auth_portal_post", return_value=False):
+        with patch.object(app, "do_auth_portal_post", return_value=portal_post_result(False)):
             for _ in range(3):
                 app.do_auth(self.config, None, app.TimingRecord())
         self.assertEqual(app._AUTH_IN_FLIGHT, 0)
@@ -643,30 +695,33 @@ class AttemptTimingTests(unittest.TestCase):
         with patch.object(app.urllib.request, "build_opener", return_value=opener):
             with patch.object(app.urllib.request, "urlopen",
                               side_effect=AssertionError("Unexpected network request")):
-                ok = app.do_auth_portal_post(self.config, t)
+                ok, posted = app.do_auth_portal_post(self.config, t)
         self.assertFalse(ok)
         self.assertEqual(t.portal_result, "fail")
         self.assertIn("mac collision", t.portal_message)
         self.assertEqual(t.portal_http_status, 200)
         self.assertEqual(t.http_requests, 3)
         self.assertEqual(t.socket_probes, 0)
+        # The classification must line up with what the portal actually said —
+        # this is the sample the fast-retry candidate policy depends on.
+        self.assertEqual(posted.kind, app.RESULT_SESSION_CONFLICT)
 
     def test_instrumentation_keeps_do_auth_returning_a_plain_bool(self):
         # A truthy tuple would read as success at every existing call site, so
         # the observation hook must not change the return contract.
-        with patch.object(app, "do_auth_portal_post", return_value=True), \
+        with patch.object(app, "do_auth_portal_post", return_value=portal_post_result(True)), \
              patch.object(app, "check_network", return_value=(True, "OK")):
             ok = app.do_auth(self.config, None, app.TimingRecord())
         self.assertIs(type(ok), bool)
         self.assertTrue(ok)
-        with patch.object(app, "do_auth_portal_post", return_value=False):
+        with patch.object(app, "do_auth_portal_post", return_value=portal_post_result(False)):
             failed = app.do_auth(self.config, None, app.TimingRecord())
         self.assertIs(type(failed), bool)
         self.assertFalse(failed)
 
     def test_verify_attempts_are_counted_per_confirmation_check(self):
         t = app.TimingRecord()
-        with patch.object(app, "do_auth_portal_post", return_value=True), \
+        with patch.object(app, "do_auth_portal_post", return_value=portal_post_result(True)), \
              patch.object(app, "check_network",
                           side_effect=[(False, "offline"), (False, "offline"), (True, "OK")]), \
              patch.object(app.time, "sleep"):
@@ -798,6 +853,188 @@ class AttemptTimingTests(unittest.TestCase):
         # this past the bound and FAILS the test, which is what makes it a real
         # guard rather than a description of current behaviour.
         self.assertLess(int(match.group(1)), 2, recovery[0])
+
+
+class AuthClassificationTests(unittest.TestCase):
+    """Phase B: failure classification and the retry policy.
+
+    These are the decisions that will eventually let a session conflict be
+    retried in a second while everything else keeps the regular backoff. They
+    are pure functions and a pure policy object, so they are tested exhaustively
+    here and NOT enabled anywhere: see the default-off tests below.
+    """
+
+    def setUp(self):
+        self.config = dict(app.DEFAULT_CONFIG, username="student", password="test")
+        self.log_patch = patch.object(app, "log")
+        self.log_patch.start()
+        self.addCleanup(self.log_patch.stop)
+
+    def result(self, kind, ok=False, message=""):
+        return app.AuthResult(ok, kind, portal_message=message)
+
+    # ── classification ──────────────────────────────────────────────────────
+    def test_observed_mac_collision_is_a_session_conflict(self):
+        message = ("运营商用户认证失败,失败原因[brac error: "
+                   "create session failed(mac collision)!]")
+        self.assertEqual(app.classify_portal_failure(message),
+                         app.RESULT_SESSION_CONFLICT)
+
+    def test_device_not_registered_is_a_portal_config_error(self):
+        # The 09-19 message, observed with a proxy running. It must not be
+        # classified as a conflict: retrying it faster cannot help.
+        message = "WEB认证设备未注册，请确认SAM+/portal/设备上的参数配置是否一致"
+        self.assertEqual(app.classify_portal_failure(message),
+                         app.RESULT_PORTAL_CONFIG_ERROR)
+
+    def test_credential_wording_is_not_a_conflict(self):
+        for message in ("密码错误", "用户不存在", "invalid password"):
+            with self.subTest(message=message):
+                self.assertEqual(app.classify_portal_failure(message),
+                                 app.RESULT_CREDENTIAL_ERROR)
+
+    def test_generic_account_wording_is_not_treated_as_permanent(self):
+        # "账号已在线" is a conflict-flavoured message, but this classifier must
+        # not claim it on a guess: unknown stays unknown and takes the backoff.
+        self.assertEqual(app.classify_portal_failure("该账号已在线"),
+                         app.RESULT_UNKNOWN)
+
+    def test_empty_and_unrecognised_messages_stay_unknown(self):
+        for message in ("", None, "something new the portal started saying"):
+            with self.subTest(message=message):
+                self.assertEqual(app.classify_portal_failure(message),
+                                 app.RESULT_UNKNOWN)
+
+    def test_auth_result_rejects_an_invented_kind(self):
+        self.assertEqual(app.AuthResult(False, "not-a-kind").kind,
+                         app.RESULT_UNKNOWN)
+
+    def test_auth_result_truthiness_matches_ok(self):
+        # Callers that still treat the result as a flag must not be misled in
+        # either direction.
+        self.assertFalse(app.AuthResult(False, app.RESULT_UNKNOWN))
+        self.assertTrue(app.AuthResult(True, app.RESULT_UNKNOWN))
+
+    # ── the fast path is off unless explicitly enabled ──────────────────────
+    def test_fast_path_is_disabled_by_default(self):
+        policy = app.RetryPolicy(dict(app.DEFAULT_CONFIG))
+        self.assertFalse(policy.fast_enabled)
+        decision = policy.decide(self.result(app.RESULT_SESSION_CONFLICT),
+                                 backoff_step=1, fast_used=0,
+                                 seconds_since_first_conflict=0)
+        self.assertEqual(decision.delay, app.auth_retry_delay(self.config, 1))
+        self.assertIn("disabled", decision.reason)
+
+    def test_budget_values_alone_do_not_enable_the_fast_path(self):
+        # A deployment that copies the candidate parameters but forgets the
+        # enable flag must stay on the regular backoff — this is the guard that
+        # keeps "candidate, not production default" true in practice.
+        config = dict(self.config, auth_conflict_retry_seconds=1,
+                      auth_conflict_max_fast_retries=15,
+                      auth_conflict_fast_window_seconds=25)
+        policy = app.RetryPolicy(config)
+        self.assertFalse(policy.fast_enabled)
+        self.assertIsNone(policy.fast_budget())
+        self.assertEqual(
+            policy.decide(self.result(app.RESULT_SESSION_CONFLICT), 1, 0, 0).delay,
+            app.auth_retry_delay(config, 1))
+
+    def test_enabling_it_is_explicit_and_then_used(self):
+        config = dict(self.config, auth_conflict_fast_enabled=True)
+        policy = app.RetryPolicy(config)
+        self.assertTrue(policy.fast_enabled)
+        decision = policy.decide(self.result(app.RESULT_SESSION_CONFLICT),
+                                 backoff_step=1, fast_used=0,
+                                 seconds_since_first_conflict=0)
+        self.assertEqual(decision.delay, 1)
+        self.assertIn("fast retry 1/15", decision.reason)
+
+    # ── budget and boundaries ───────────────────────────────────────────────
+    def test_budget_is_count_times_interval_within_the_window(self):
+        config = dict(self.config, auth_conflict_fast_enabled=True,
+                      auth_conflict_retry_seconds=1,
+                      auth_conflict_max_fast_retries=15,
+                      auth_conflict_fast_window_seconds=25)
+        budget = app.RetryPolicy(config).fast_budget()
+        self.assertEqual(budget["count"], 15)
+        self.assertEqual(budget["total"], 15)
+
+    def test_window_shrinks_the_budget(self):
+        config = dict(self.config, auth_conflict_fast_enabled=True,
+                      auth_conflict_retry_seconds=2,
+                      auth_conflict_max_fast_retries=50,
+                      auth_conflict_fast_window_seconds=10)
+        self.assertEqual(app.RetryPolicy(config).fast_budget()["count"], 5)
+
+    def test_spent_budget_falls_back_to_the_regular_chain(self):
+        config = dict(self.config, auth_conflict_fast_enabled=True,
+                      auth_conflict_max_fast_retries=2)
+        policy = app.RetryPolicy(config)
+        self.assertEqual(
+            policy.decide(self.result(app.RESULT_SESSION_CONFLICT), 1, 2, 0).delay,
+            app.auth_retry_delay(config, 1))
+        self.assertIn("budget spent", 
+                      policy.decide(self.result(app.RESULT_SESSION_CONFLICT), 1, 2, 0).reason)
+
+    def test_window_boundary_is_exclusive(self):
+        # At exactly the window the fast path is closed, matching the plan's
+        # "must start strictly before the deadline".
+        config = dict(self.config, auth_conflict_fast_enabled=True,
+                      auth_conflict_fast_window_seconds=25)
+        policy = app.RetryPolicy(config)
+        inside = policy.decide(self.result(app.RESULT_SESSION_CONFLICT), 1, 0, 24.9)
+        outside = policy.decide(self.result(app.RESULT_SESSION_CONFLICT), 1, 0, 25)
+        self.assertEqual(inside.delay, 1)
+        self.assertEqual(outside.delay, app.auth_retry_delay(config, 1))
+        self.assertIn("window closed", outside.reason)
+
+    def test_missing_conflict_clock_does_not_open_the_fast_path(self):
+        config = dict(self.config, auth_conflict_fast_enabled=True)
+        decision = app.RetryPolicy(config).decide(
+            self.result(app.RESULT_SESSION_CONFLICT), 1, 0, None)
+        self.assertEqual(decision.delay, app.auth_retry_delay(config, 1))
+        self.assertIn("window closed", decision.reason)
+
+    def test_other_kinds_never_use_the_fast_path(self):
+        config = dict(self.config, auth_conflict_fast_enabled=True)
+        policy = app.RetryPolicy(config)
+        for kind in (app.RESULT_NETWORK_ERROR, app.RESULT_VERIFICATION_FAILED,
+                     app.RESULT_PORTAL_CONFIG_ERROR, app.RESULT_CREDENTIAL_ERROR,
+                     app.RESULT_UNKNOWN):
+            with self.subTest(kind=kind):
+                decision = policy.decide(self.result(kind), 1, 0, 0)
+                self.assertEqual(decision.delay, app.auth_retry_delay(config, 1))
+                self.assertIn(kind, decision.reason)
+
+    # ── backoff continuity ──────────────────────────────────────────────────
+    def test_backoff_step_spanning_the_chain_never_jumps_to_the_cap(self):
+        # The whole point of separating backoff_step from the raw failure count:
+        # a burst of fast retries must not shove the regular backoff to 300s.
+        config = dict(self.config, auth_conflict_fast_enabled=True)
+        policy = app.RetryPolicy(config)
+        observed = [policy.decide(
+            self.result(app.RESULT_NETWORK_ERROR), step, 0, 0).delay
+            for step in range(1, 7)]
+        self.assertEqual(observed, [3, 5, 10, 20, 40, 80])
+        self.assertNotIn(300, observed)
+
+    def test_fast_retries_do_not_change_auth_retry_delay(self):
+        # The regular backoff function is untouched by phase B; this pins that
+        # the candidate policy borrows it rather than editing it.
+        self.assertEqual([app.auth_retry_delay(self.config, n) for n in range(1, 10)],
+                         [3, 5, 10, 20, 40, 80, 160, 300, 300])
+
+    def test_decide_rejects_a_successful_result(self):
+        with self.assertRaises(ValueError):
+            app.RetryPolicy(self.config).decide(
+                app.AuthResult(True, app.RESULT_UNKNOWN), 1, 0, 0)
+
+    def test_budget_description_states_the_state(self):
+        off = app.RetryPolicy(dict(app.DEFAULT_CONFIG)).describe_budget()
+        self.assertIn("disabled", off)
+        on = app.RetryPolicy(dict(self.config,
+                                  auth_conflict_fast_enabled=True)).describe_budget()
+        self.assertIn("15 retries of 1s", on)
 
 
 class SilentModeTests(unittest.TestCase):

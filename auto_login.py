@@ -958,6 +958,13 @@ def do_auth_portal_post(config, timings=None):
     Step 1: fallback — access portal index.jsp directly, then try API
     Step 2: POST credentials to InterFace.do?method=login
 
+    Returns `(ok, result)`: the boolean is what every existing caller uses, and
+    the AuthResult carries *why* it failed so the detection loop can pick a
+    retry policy. Returning a tuple rather than a bare truthy object is
+    deliberate — a two-element tuple is always truthy, so callers that still do
+    `if do_auth_portal_post(...)` would be silently wrong; callers are updated
+    explicitly instead.
+
     `timings` is an optional TimingRecord used purely for observation; passing
     None keeps the original behaviour and log format exactly as before.
     """
@@ -967,9 +974,15 @@ def do_auth_portal_post(config, timings=None):
     check_url = config["check_url"]
     timeout = config["request_timeout"]
 
+    def result_for(ok, kind, result_text="", message="", status=None):
+        requests = timings.http_requests if timings is not None else 0
+        return AuthResult(ok, kind, portal_result=result_text,
+                          portal_message=message, http_status=status,
+                          http_requests_issued=requests, timings=timings)
+
     if not username or not password:
         log("username or password not configured", "ERROR")
-        return False
+        return False, result_for(False, RESULT_CREDENTIAL_ERROR)
 
     cj = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(
@@ -1033,7 +1046,7 @@ def do_auth_portal_post(config, timings=None):
             # phase would stay None and its elapsed time would be silently
             # attributed to nothing (or, worse, counted again later).
             timings.mark_discovery_done()
-        return False
+        return False, result_for(False, RESULT_NETWORK_ERROR, message=str(e))
 
     # Step 1.5: if we still have no query params, try portal APIs to get them
     query_string = urlparse(index_url).query
@@ -1133,10 +1146,13 @@ def do_auth_portal_post(config, timings=None):
         if not result_text or result_text != "success":
             log(f"Auth FAIL [HTTP {resp.status}, {elapsed:.0f}ms]{_timing_suffix(timings)} "
                 f"body: {describe_portal_body(body)}", "ERROR")
-            return False
+            return False, _result_for_post_failure(
+                timings, message_text, result_text, resp.status,
+                timings.http_requests if timings is not None else 0)
         log(f"Auth OK [HTTP {resp.status}, {elapsed:.0f}ms]{_timing_suffix(timings)} "
             f"body: {describe_portal_body(body)}", "AUTH")
-        return True
+        return True, result_for(True, RESULT_UNKNOWN, result_text="success",
+                                message=message_text, status=resp.status)
     except Exception as e:
         elapsed = (time.time() - start) * 1000
         if timings is not None:
@@ -1144,7 +1160,9 @@ def do_auth_portal_post(config, timings=None):
             # fields stay empty rather than being filled with a guess.
             timings.mark_login_done()
         log(f"Auth FAIL [{e}, {elapsed:.0f}ms]{_timing_suffix(timings)}", "ERROR")
-        return False
+        # A transport-level failure is a network error: never eligible for the
+        # conflict fast path, so it takes the regular backoff.
+        return False, result_for(False, RESULT_NETWORK_ERROR, message=str(e))
 
 
 def do_auth_http(url, timeout):
@@ -1174,18 +1192,25 @@ def do_auth_browser(url, wait_seconds):
     simulate_enter()
 
 
-def do_auth(config, last_auth_time, timings=None):
+def do_auth(config, last_auth_time, timings=None, result_out=None):
     """Attempt authentication and confirm real connectivity.
 
-    Still returns a plain bool — every existing caller (CLI, GUI, tray) depends
-    on that, and a truthy non-bool would silently read as success. `timings` is
-    an optional TimingRecord filled in for observation only; it never changes
-    what happens.
+    Returns a plain bool — every existing caller (CLI, GUI, tray) depends on
+    that, and a truthy non-bool would silently read as success. Callers that
+    need to know *why* it failed pass a one-element list as `result_out` and
+    read `result_out[0]` afterwards; an AuthResult is truthy only via its own
+    `__bool__`, so it is never returned from here by accident.
 
-    The record is closed on every exit path, including the early returns, so a
-    failed attempt can never report total_ms = None (which would be
-    indistinguishable from "not measured").
+    `timings` is an optional TimingRecord filled in for observation only; it
+    never changes what happens. The record is closed on every exit path,
+    including the early returns, so a failed attempt can never report
+    total_ms = None (which would be indistinguishable from "not measured").
     """
+    def publish(ok, result):
+        if result_out is not None:
+            result_out.append(result)
+        return ok
+
     now = datetime.now()
     cooldown = config.get("auth_cooldown_seconds", 3)
     if last_auth_time and (now - last_auth_time).total_seconds() < cooldown:
@@ -1195,7 +1220,11 @@ def do_auth(config, last_auth_time, timings=None):
             # Skipped before doing anything: phases stay None, and the record is
             # closed so total_ms is a real (tiny) number rather than missing.
             timings.mark_finished()
-        return False
+        # Not an auth failure at all: nothing was attempted, so it must not
+        # consume any retry budget.
+        return publish(False, AuthResult(False, RESULT_UNKNOWN,
+                                         portal_message="cooldown skip",
+                                         timings=timings))
 
     method = config.get("auth_method", "http")
     url = config.get("portal_url", "")
@@ -1218,7 +1247,8 @@ def do_auth(config, last_auth_time, timings=None):
     try:
         if timings is not None and in_flight > 1:
             timings.overlapping_auth = True
-        return _do_auth_inner(config, method, url, timeout, timings)
+        ok, result = _do_auth_inner(config, method, url, timeout, timings)
+        return publish(ok, result)
     finally:
         with _AUTH_IN_FLIGHT_LOCK:
             _AUTH_IN_FLIGHT -= 1
@@ -1227,38 +1257,73 @@ def do_auth(config, last_auth_time, timings=None):
 
 
 def _do_auth_inner(config, method, url, timeout, timings):
-    """The original auth body, split out so do_auth can always close the record."""
-    if method == "portal_post":
-        if not do_auth_portal_post(config, timings):
-            return False
-    elif method == "browser":
+    """The auth body, split out so do_auth can always close the timing record.
+
+    Returns `(ok, result)`. `result` explains the outcome; for the http and
+    browser modes the portal gives us nothing to classify, so the kind stays
+    `unknown` and those modes take the regular backoff.
+    """
+    if method == "browser":
         do_auth_browser(url, config.get("browser_wait_seconds", 3))
         log("Browser auth completed (Enter sent)", "AUTH")
-    else:
-        start = time.time()
-        if timings is not None:
-            timings.mark_login_started()
-        status, body, info = do_auth_http(url, timeout)
-        elapsed = (time.time() - start) * 1000
-        if timings is not None:
-            timings.mark_login_done()
-            timings.portal_http_status = status
-        # Structural description, not a masked excerpt: http mode is just as
-        # likely to echo a session token, and a blacklist pass over a raw body
-        # cannot be trusted (a short unforeseen value slips through).
-        snippet = describe_portal_body(body)
-        if status and 200 <= status < 300:
-            body_lower = body.lower() if body else ""
-            if "fail" in body_lower or "error" in body_lower:
-                log(f"Auth FAIL [{info}, {elapsed:.0f}ms]{_timing_suffix(timings)} "
-                    f"body: {snippet}", "ERROR")
-                return False
-            log(f"Auth OK [{info}, {elapsed:.0f}ms]{_timing_suffix(timings)} "
-                f"body: {snippet}", "AUTH")
-            log("NOTE: http 模式无法100%确认认证成功，建议改用 portal_post 模式", "WARN")
-        else:
-            log(f"Auth FAIL [{info}, {elapsed:.0f}ms]{_timing_suffix(timings)}", "ERROR")
-            return False
+        return _finish_by_verification(config, method, timings,
+                                       AuthResult(True, RESULT_UNKNOWN))
+    elif method != "portal_post":
+        return _do_auth_http_mode(config, url, timeout, timings)
+
+    ok, result = do_auth_portal_post(config, timings)
+    if not ok:
+        return False, result
+
+    # The portal accepted the credentials; connectivity still has to be proven.
+    return _finish_by_verification(config, method, timings, result)
+
+
+def _do_auth_http_mode(config, url, timeout, timings):
+    start = time.time()
+    if timings is not None:
+        timings.mark_login_started()
+    status, body, info = do_auth_http(url, timeout)
+    elapsed = (time.time() - start) * 1000
+    if timings is not None:
+        timings.mark_login_done()
+        timings.portal_http_status = status
+    # Structural description, not a masked excerpt: http mode is just as
+    # likely to echo a session token, and a blacklist pass over a raw body
+    # cannot be trusted (a short unforeseen value slips through).
+    snippet = describe_portal_body(body)
+    requests = timings.http_requests if timings is not None else 0
+    if status and 200 <= status < 300:
+        body_lower = body.lower() if body else ""
+        if "fail" in body_lower or "error" in body_lower:
+            log(f"Auth FAIL [{info}, {elapsed:.0f}ms]{_timing_suffix(timings)} "
+                f"body: {snippet}", "ERROR")
+            # http mode gives no structured portal verdict, so it cannot claim a
+            # conflict: it stays unknown and takes the regular backoff.
+            return False, AuthResult(False, RESULT_UNKNOWN, portal_result="fail",
+                                     http_status=status,
+                                     http_requests_issued=requests, timings=timings)
+        log(f"Auth OK [{info}, {elapsed:.0f}ms]{_timing_suffix(timings)} "
+            f"body: {snippet}", "AUTH")
+        log("NOTE: http 模式无法100%确认认证成功，建议改用 portal_post 模式", "WARN")
+        return _finish_by_verification(
+            config, "http", timings,
+            AuthResult(True, RESULT_UNKNOWN, http_status=status,
+                       http_requests_issued=requests, timings=timings))
+    log(f"Auth FAIL [{info}, {elapsed:.0f}ms]{_timing_suffix(timings)}", "ERROR")
+    kind = RESULT_NETWORK_ERROR if status is None else RESULT_UNKNOWN
+    return False, AuthResult(False, kind, portal_message=info,
+                             http_status=status, http_requests_issued=requests,
+                             timings=timings)
+
+
+def _finish_by_verification(config, method, timings, result):
+    """Shared tail: the portal's answer is not proof, so confirm connectivity.
+
+    A portal that reports success while the network stays down is
+    `verification_failed` — distinct from a rejected login, and still not ok.
+    """
+    timeout = config["request_timeout"]
 
     # The portal response alone does not establish Internet connectivity.
     for attempt in range(3):
@@ -1272,7 +1337,7 @@ def _do_auth_inner(config, method, url, timeout, timings):
             if timings is not None:
                 timings.mark_verify_done()
                 timings.mark_finished()
-            return True
+            return True, result
     if timings is not None:
         # The portal accepted the credentials but connectivity still failed.
         # Recorded so a "portal accepted / network not up" case is not confused
@@ -1280,7 +1345,14 @@ def _do_auth_inner(config, method, url, timeout, timings):
         timings.mark_verify_done()
         timings.mark_finished()
     log(f"Auth response received but network is unavailable: {detail}", "ERROR")
-    return False
+    # Distinct from a rejected login: the credentials were accepted, so retrying
+    # the login itself is not the fix — this takes the regular backoff too.
+    return False, AuthResult(False, RESULT_VERIFICATION_FAILED,
+                             portal_result=result.portal_result,
+                             portal_message=detail,
+                             http_status=result.http_status,
+                             http_requests_issued=result.http_requests_issued,
+                             timings=timings)
 
 
 def _input(prompt, default=""):
@@ -1779,12 +1851,243 @@ def log_failure_context(url, detail):
 
 
 def auth_retry_delay(config, failures):
-    """First retry is quick; subsequent failures back off from a separate base."""
+    """First retry is quick; subsequent failures back off from a separate base.
+
+    Kept exactly as it was: it is the regular backoff, and the samples showed it
+    is what the outage time is actually spent on. RetryPolicy below decides
+    *whether* to use it; it never changes what this function returns.
+    """
     first = max(1, config.get("auth_cooldown_seconds", 3))
     base = max(first, config.get("auth_retry_backoff_seconds", 5))
     if failures <= 1:
         return first
     return min(max(300, base), base * 2 ** min(failures - 2, 10))
+
+
+# ── Auth result classification ───────────────────────────────────────────────
+#
+# The detection loop needs to know *why* a login failed, because the right
+# response differs: a portal that is up and rejecting the session is worth
+# retrying in a second, while a timeout or a portal-side configuration error is
+# not worth retrying faster at all. Classification is deliberately narrow — it
+# only claims what a sample actually supports, and everything else stays
+# `unknown` and takes the regular backoff.
+
+RESULT_SESSION_CONFLICT = "session_conflict"
+RESULT_CREDENTIAL_ERROR = "credential_error"
+RESULT_NETWORK_ERROR = "network_error"
+RESULT_PORTAL_CONFIG_ERROR = "portal_config_error"
+RESULT_VERIFICATION_FAILED = "verification_failed"
+RESULT_UNKNOWN = "unknown"
+
+_AUTH_KINDS = (
+    RESULT_SESSION_CONFLICT, RESULT_CREDENTIAL_ERROR, RESULT_NETWORK_ERROR,
+    RESULT_PORTAL_CONFIG_ERROR, RESULT_VERIFICATION_FAILED, RESULT_UNKNOWN,
+)
+
+# Observed on this campus network, plus wording the portal family is known to
+# use. No generic substrings ("账号", "invalid"): "账号已在线" is a conflict, not
+# a credential problem, and guessing wrong sends a transient failure down the
+# long backoff.
+_SESSION_CONFLICT_MARKERS = (
+    "mac collision",
+    "create session failed",
+    "会话冲突",
+)
+_CREDENTIAL_ERROR_MARKERS = (
+    "密码错误", "密码不正确", "用户不存在", "用户名不存在", "账号不存在",
+    "password error", "invalid password", "wrong password",
+    "认证失败,失败原因[密码",
+)
+_PORTAL_CONFIG_MARKERS = (
+    "设备未注册", "未注册", "sam+", "portal/设备", "参数配置",
+)
+
+
+def classify_portal_failure(message):
+    """Map a portal rejection message to an auth result kind.
+
+    Order matters: the configuration wording is checked before the conflict
+    wording, because the observed "device not registered" message also arrives
+    as a generic auth failure. Anything unrecognised stays `unknown`.
+    """
+    text = (message or "").lower()
+    if not text:
+        return RESULT_UNKNOWN
+    if any(marker in text for marker in _PORTAL_CONFIG_MARKERS):
+        return RESULT_PORTAL_CONFIG_ERROR
+    if any(marker in text for marker in _SESSION_CONFLICT_MARKERS):
+        return RESULT_SESSION_CONFLICT
+    if any(marker in text for marker in _CREDENTIAL_ERROR_MARKERS):
+        return RESULT_CREDENTIAL_ERROR
+    return RESULT_UNKNOWN
+
+
+class AuthResult:
+    """Why an auth attempt ended the way it did.
+
+    `ok` keeps the meaning the whole program already relies on: the portal
+    accepted the credentials *and* connectivity was confirmed. A portal that
+    says "success" while the network stays down is NOT ok — that is precisely
+    the `verification_failed` case.
+    """
+
+    __slots__ = ("ok", "kind", "portal_result", "portal_message", "http_status",
+                 "http_requests_issued", "timings")
+
+    def __init__(self, ok, kind, portal_result="", portal_message="",
+                 http_status=None, http_requests_issued=0, timings=None):
+        self.ok = ok
+        self.kind = kind if kind in _AUTH_KINDS else RESULT_UNKNOWN
+        self.portal_result = portal_result
+        self.portal_message = portal_message
+        self.http_status = http_status
+        self.http_requests_issued = http_requests_issued
+        self.timings = timings
+
+    def describe(self):
+        """One short line for the log; never includes a raw network value."""
+        parts = [f"kind={self.kind}", f"ok={self.ok}"]
+        if self.portal_result:
+            parts.append(f"portal={self.portal_result}")
+        if self.portal_message:
+            parts.append(f"msg={redact_for_log(self.portal_message)}")
+        return " | ".join(parts)
+
+    def __bool__(self):
+        return bool(self.ok)
+
+    def __repr__(self):
+        return f"AuthResult(ok={self.ok}, kind={self.kind})"
+
+
+def _result_for_post_failure(timings, message, result_text, status, requests):
+    """Build the AuthResult for a rejected login POST."""
+    return AuthResult(False, classify_portal_failure(message),
+                      portal_result=result_text, portal_message=message,
+                      http_status=status, http_requests_issued=requests,
+                      timings=timings)
+
+
+# ── Retry policy ─────────────────────────────────────────────────────────────
+
+RETRY_FAST = "fast"
+RETRY_BACKOFF = "backoff"
+
+
+class RetryDecision:
+    """The delay to wait plus *why*, so the log can state the reason."""
+
+    __slots__ = ("delay", "reason", "fast_used")
+
+    def __init__(self, delay, reason, fast_used=0):
+        self.delay = delay
+        self.reason = reason
+        self.fast_used = fast_used
+
+    def __repr__(self):
+        return f"RetryDecision(delay={self.delay}, reason={self.reason!r})"
+
+
+# The candidate fast-retry parameters. They are NOT production defaults: the
+# whole fast path is off unless `auth_conflict_fast_enabled` is explicitly true,
+# because the samples only show that the third attempt succeeded, not that an
+# earlier one would have. Enable it per deployment, watch the request count, and
+# turn it off if conflicts grow.
+DEFAULT_CONFLICT_FAST_RETRY_SECONDS = 1
+DEFAULT_CONFLICT_FAST_MAX_RETRIES = 15
+DEFAULT_CONFLICT_FAST_WINDOW_SECONDS = 25
+
+
+class RetryPolicy:
+    """Decides the wait after a failed auth attempt.
+
+    Only an explicitly enabled, bounded conflict fast path can produce a short
+    delay. Every other combination — fast path disabled, another failure kind, a
+    budget spent, or the window closed — falls through to the regular backoff,
+    which is guaranteed to span the whole backoff chain rather than jumping to
+    its cap.
+    """
+
+    def __init__(self, config):
+        self.config = config
+        self.fast_enabled = bool(config.get("auth_conflict_fast_enabled", False))
+        self.fast_seconds = max(
+            1, int(config.get("auth_conflict_retry_seconds",
+                              DEFAULT_CONFLICT_FAST_RETRY_SECONDS)))
+        self.max_fast = max(0, int(config.get("auth_conflict_max_fast_retries",
+                                              DEFAULT_CONFLICT_FAST_MAX_RETRIES)))
+        self.window = max(0, int(config.get("auth_conflict_fast_window_seconds",
+                                            DEFAULT_CONFLICT_FAST_WINDOW_SECONDS)))
+
+    def fast_budget(self):
+        """How many fast retries fit inside the window, and their total wait.
+
+        None when the fast path is off (or configured to nothing usable). Kept
+        as its own method so the log can state the budget explicitly before it
+        is ever spent, and so tests can pin it without running the loop.
+        """
+        if not (self.fast_enabled and self.max_fast > 0 and self.window > 0):
+            return None
+        count = min(self.max_fast, self.window // self.fast_seconds)
+        if count <= 0:
+            return None
+        return {"count": count, "each": self.fast_seconds,
+                "total": count * self.fast_seconds, "window": self.window}
+
+    def describe_budget(self, backoff_step=1):
+        """A one-line, human-readable account of what will happen after a
+        failure — logged so a misconfigured deployment is visible up front."""
+        chain = ", ".join(f"{auth_retry_delay(self.config, backoff_step + offset)}s"
+                          for offset in range(5))
+        budget = self.fast_budget()
+        if budget is None:
+            why = "disabled" if not self.fast_enabled else "configured to nothing usable"
+            return f"conflict fast path {why}; regular backoff {chain}..."
+        return (f"conflict fast path: up to {budget['count']} retries of "
+                f"{budget['each']}s within {budget['window']}s "
+                f"(max {budget['total']}s of waiting); then regular backoff {chain}...")
+
+    def _backoff_chain(self, steps=6):
+        return ", ".join(f"{auth_retry_delay(self.config, n)}s"
+                         for n in range(1, steps + 1))
+
+    def decide(self, result, backoff_step, fast_used, seconds_since_first_conflict):
+        """Return the RetryDecision for a failed attempt.
+
+        `result.ok` False is assumed. `backoff_step` is the regular backoff
+        level (1 = first regular retry), never the raw failure count — keeping
+        them separate is what stops a burst of fast retries from shoving the
+        regular backoff straight to its cap.
+        """
+        kind = getattr(result, "kind", RESULT_UNKNOWN)
+        if result.ok:
+            raise ValueError("decide() is for failed attempts only")
+
+        if kind == RESULT_SESSION_CONFLICT and self.fast_enabled:
+            if (fast_used < self.max_fast
+                    and seconds_since_first_conflict is not None
+                    and seconds_since_first_conflict < self.window):
+                return RetryDecision(
+                    self.fast_seconds,
+                    f"conflict fast retry {fast_used + 1}/{self.max_fast} "
+                    f"within {self.window}s window",
+                    fast_used=fast_used + 1)
+
+        # Regular backoff, and the reason names the class so the log explains
+        # why a conflict did not get the fast path when it did not.
+        reason = self._backoff_reason(kind, fast_used)
+        return RetryDecision(auth_retry_delay(self.config, backoff_step), reason)
+
+    def _backoff_reason(self, kind, fast_used):
+        if kind != RESULT_SESSION_CONFLICT:
+            return f"regular backoff: kind={kind} is not eligible for fast retry"
+        if not self.fast_enabled:
+            return "regular backoff: conflict fast path is disabled"
+        if fast_used >= self.max_fast:
+            return f"regular backoff: fast budget spent ({fast_used}/{self.max_fast})"
+        return "regular backoff: fast window closed"
+
 
 
 def run_detection_loop(config, stop_event=None, status_callback=None,
