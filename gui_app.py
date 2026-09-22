@@ -2754,7 +2754,8 @@ class GuiApp:
                 self._q.put(("auth_done", (True, time.time() - started, None, True)))
                 return
             self._q.put(("log", (f"网络不通（{detail}），开始认证…", "warn")))
-            ok = core.do_auth(self._config, None)
+            ok = core.do_auth(self._config, None,
+                              stop_event=self._auth_thread_stop)
             if self._auth_thread_stop.is_set():
                 return
             cost = time.time() - started
@@ -3784,6 +3785,7 @@ def main():
         return core.run_silent_mode(args.run_minutes, interactive_launch=args.now)
 
     try:
+        core.log(core.runtime_identity_line(), "START")
         return GuiApp().run()
     except Exception as e:
         core.log(f"GUI failed to start: {e}", "ERROR")

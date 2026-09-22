@@ -8,6 +8,7 @@ import time
 import os
 import sys
 import glob
+import hashlib
 import ctypes
 import argparse
 import re
@@ -19,7 +20,27 @@ if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "v1.7.6-observe+c395c4e"
+VERSION = "v1.7.6-b-candidate.20260922.1"
+
+
+def runtime_identity_line():
+    """Identify the running artifact in its own log, even after it is replaced.
+
+    A file hash checked hours later does not identify an earlier process. Log
+    both the launch path and bytes loaded at startup so a future incident can
+    be attributed to the actual executable instead of a similarly named copy.
+    """
+    path = os.path.abspath(sys.executable if getattr(sys, "frozen", False)
+                           else __file__)
+    try:
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(block)
+        sha256 = digest.hexdigest()
+    except OSError:
+        sha256 = "unavailable"
+    return f"Runtime identity: version={VERSION} path={path} sha256={sha256}"
 
 # Required on Windows 11 for tray icon to appear — set before any window creation
 try:
@@ -369,14 +390,13 @@ def _now():
     return time.monotonic()
 
 
-# How many auth attempts are executing right now, in this process. Used only to
-# detect and report *overlapping* submissions (a GUI manual click racing the
-# detection loop); two simultaneous logins to one portal is a plausible way to
-# manufacture a session conflict, so the observation matters. This is a
-# reporting counter, not a lock — preventing the overlap is a later decision
-# that depends on what the samples show.
+# How many auth attempts are executing right now, in this process. Kept for
+# telemetry; the separate submit lock below now prevents actual overlap.
 _AUTH_IN_FLIGHT = 0
 _AUTH_IN_FLIGHT_LOCK = threading.Lock()
+# Protect the entire request/verification path, not just the observation counter.
+# A GUI click and the guard must never submit to the portal at the same time.
+_AUTH_SUBMIT_LOCK = threading.Lock()
 
 
 def _metric_ms(started_at, finished_at):
@@ -478,6 +498,26 @@ def redact_for_log(text, limit=200):
     if limit and len(cleaned) > limit:
         cleaned = cleaned[:limit] + "..."
     return cleaned
+
+
+def network_error_for_log(error):
+    """Describe transport failures without echoing exception-supplied URLs.
+
+    urllib exceptions may include the full request URL (including portal
+    session parameters), so their string form is not suitable for any log or
+    GUI detail. The class and OS error number retain useful diagnostics.
+    """
+    if isinstance(error, urllib.error.HTTPError):
+        return f"HTTP {error.code}"
+    if isinstance(error, urllib.error.URLError):
+        error = error.reason
+    if isinstance(error, TimeoutError):
+        return "timeout"
+    if isinstance(error, OSError):
+        number = getattr(error, "errno", None)
+        return (f"{type(error).__name__} errno={number}"
+                if number is not None else type(error).__name__)
+    return type(error).__name__
 
 
 def describe_portal_body(body):
@@ -613,7 +653,7 @@ class TimingRecord:
         "http_requests", "socket_probes", "verify_attempts", "portal_http_status",
         "portal_result", "portal_message",
         "attempt_index", "overlapping_auth", "peer_device_state",
-        "retry_planned_wait_ms", "retry_lateness_ms",
+        "retry_planned_wait_ms", "retry_lateness_ms", "_retry_due_at",
     )
 
     def __init__(self):
@@ -632,9 +672,8 @@ class TimingRecord:
         # ── A.5 clue fields ──
         # Which attempt inside this outage this is (1 = the first one).
         self.attempt_index = 0
-        # True when another auth was already in flight. Measured, not assumed:
-        # an overlapping submit is one of the few *definite* self-inflicted
-        # causes, so it must be observed rather than defaulted to False.
+        # Kept for log compatibility. With the submit lock, actual in-process
+        # overlap must remain False; lock contention is not a portal submit.
         self.overlapping_auth = False
         # User-supplied note about other devices on the same account. Usually
         # empty: it depends on the user reporting it, so absences prove nothing.
@@ -642,6 +681,7 @@ class TimingRecord:
         # Scheduling quality: how long we planned to wait vs how late we were.
         self.retry_planned_wait_ms = None
         self.retry_lateness_ms = None
+        self._retry_due_at = None
 
     def count_request(self):
         """Count one HTTP request actually issued for this attempt."""
@@ -660,12 +700,9 @@ class TimingRecord:
     def reboot_timeline(self):
         """Restart the phase timeline from now, discarding every stamp.
 
-        Called once the auth mutex has been acquired. `started_at` is set when
-        the record is constructed, which happens before the lock is taken, so
-        without this the brief wait for the mutex would be charged to discovery
-        and then reported again as unaccounted overhead. The mutex only guards a
-        counter, so that wait is not worth measuring on its own — restarting the
-        timeline is what keeps the phase numbers honest.
+        Called once the submit lock has been acquired. `started_at` is set when
+        the record is constructed, so lock waiting must be excluded from portal
+        discovery and the unaccounted residual.
         """
         self.started_at = _now()
         self.discovery_finished_at = None
@@ -673,6 +710,9 @@ class TimingRecord:
         self.login_finished_at = None
         self.verify_finished_at = None
         self.finished_at = None
+        if self._retry_due_at is not None:
+            self.retry_lateness_ms = max(0.0,
+                                         (self.started_at - self._retry_due_at) * 1000)
 
     def mark_login_started(self):
         """The credential POST is about to be sent."""
@@ -705,6 +745,7 @@ class TimingRecord:
         # says anything about scheduling quality.
         if not scheduled_at:
             return
+        self._retry_due_at = scheduled_at
         self.retry_lateness_ms = max(0.0, (self.started_at - scheduled_at) * 1000)
 
     def mark_finished(self):
@@ -838,12 +879,11 @@ def check_network(url, timeout, expected_body=None):
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code}"
     except urllib.error.URLError as e:
-        reason = str(e.reason)
-        return False, reason
+        return False, network_error_for_log(e)
     except OSError as e:
-        return False, str(e)
+        return False, network_error_for_log(e)
     except Exception as e:
-        return False, type(e).__name__ + ": " + str(e)
+        return False, network_error_for_log(e)
 
 
 def simulate_enter():
@@ -952,7 +992,7 @@ _user32.PostMessageW.restype = ctypes.c_int
 # ── End of Tray API definitions ─────────────────────────────────────────────
 
 
-def do_auth_portal_post(config, timings=None):
+def do_auth_portal_post(config, timings=None, cancelled=None):
     """POST-based campus portal auth.
     Step 0: try to trigger portal redirect by accessing check_url (full browser headers)
     Step 1: fallback — access portal index.jsp directly, then try API
@@ -980,6 +1020,13 @@ def do_auth_portal_post(config, timings=None):
                           portal_message=message, http_status=status,
                           http_requests_issued=requests, timings=timings)
 
+    def abort_if_needed():
+        if cancelled is None or not cancelled():
+            return None
+        if timings is not None and timings.discovery_finished_at is None:
+            timings.mark_discovery_done()
+        return False, result_for(False, RESULT_CANCELLED, message="attempt cancelled")
+
     if not username or not password:
         log("username or password not configured", "ERROR")
         return False, result_for(False, RESULT_CREDENTIAL_ERROR)
@@ -996,6 +1043,9 @@ def do_auth_portal_post(config, timings=None):
     index_url = None
 
     # Step 0: probe check_url — portal may respond with JS redirect containing index.jsp URL
+    aborted = abort_if_needed()
+    if aborted is not None:
+        return aborted
     try:
         req = urllib.request.Request(check_url, headers=BROWSER_HEADERS)
         _count()
@@ -1014,7 +1064,7 @@ def do_auth_portal_post(config, timings=None):
                 index_url = m.group(1)
                 log(f"Portal JS redirect: {url_for_log(index_url)}", "AUTH")
     except Exception as e:
-        log(f"Probe {check_url}: {e}", "AUTH")
+        log(f"Probe {url_for_log(check_url)}: {network_error_for_log(e)}", "AUTH")
 
     # Step 1: if no JS redirect found, try accessing portal directly
     if not index_url:
@@ -1024,6 +1074,9 @@ def do_auth_portal_post(config, timings=None):
     index_url = urljoin(portal_host + "/eportal/", index_url)
     # GET index.jsp to obtain JSESSIONID cookie (needed for both paths)
     index_body = ""
+    aborted = abort_if_needed()
+    if aborted is not None:
+        return aborted
     try:
         req = urllib.request.Request(index_url, headers={"User-Agent": BROWSER_UA})
         _count()
@@ -1040,19 +1093,23 @@ def do_auth_portal_post(config, timings=None):
                 index_url = m.group(1)
                 log(f"Found JS redirect in index page: {url_for_log(index_url)}", "AUTH")
     except Exception as e:
-        log(f"Failed to fetch index page: {e}", "ERROR")
+        log(f"Failed to fetch index page: {network_error_for_log(e)}", "ERROR")
         if timings is not None:
             # Discovery aborted here, and it must still be closed: otherwise the
             # phase would stay None and its elapsed time would be silently
             # attributed to nothing (or, worse, counted again later).
             timings.mark_discovery_done()
-        return False, result_for(False, RESULT_NETWORK_ERROR, message=str(e))
+        return False, result_for(False, RESULT_NETWORK_ERROR,
+                                 message=network_error_for_log(e))
 
     # Step 1.5: if we still have no query params, try portal APIs to get them
     query_string = urlparse(index_url).query
     if not query_string:
         log("No query params, trying portal API to get device info...", "AUTH")
         for api_method in ("pageInfo", "getServices"):
+            aborted = abort_if_needed()
+            if aborted is not None:
+                return aborted
             try:
                 api_url = f"{portal_host}/eportal/InterFace.do?method={api_method}"
                 req = urllib.request.Request(api_url, headers={
@@ -1070,7 +1127,7 @@ def do_auth_portal_post(config, timings=None):
                     log(f"Got redirect with params: {url_for_log(index_url)}", "AUTH")
                     break
             except Exception as e:
-                log(f"API {api_method} failed: {e}", "AUTH")
+                log(f"API {api_method} failed: {network_error_for_log(e)}", "AUTH")
 
     # Step 1.6: extract params from index page body (hidden inputs / JS vars)
     if not query_string and index_body:
@@ -1090,6 +1147,9 @@ def do_auth_portal_post(config, timings=None):
 
     # Step 1.7: last resort — construct minimal queryString from local IP
     if not query_string:
+        aborted = abort_if_needed()
+        if aborted is not None:
+            return aborted
         try:
             parsed = urlparse(portal_host)
             host = parsed.hostname or portal_host
@@ -1105,7 +1165,7 @@ def do_auth_portal_post(config, timings=None):
             query_string = f"wlanuserip={local_ip}"
             log(f"Fallback queryString: {query_param_names(query_string)}", "AUTH")
         except Exception as e:
-            log(f"Could not construct queryString: {e}", "AUTH")
+            log(f"Could not construct queryString: {network_error_for_log(e)}", "AUTH")
 
     if timings is not None:
         timings.mark_discovery_done()
@@ -1124,6 +1184,9 @@ def do_auth_portal_post(config, timings=None):
     login_url = f"{portal_host}/eportal/InterFace.do?method=login"
 
     start = time.time()
+    aborted = abort_if_needed()
+    if aborted is not None:
+        return aborted
     try:
         req = urllib.request.Request(login_url, data=form_data, headers={
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
@@ -1159,10 +1222,11 @@ def do_auth_portal_post(config, timings=None):
             # No status/result exists for a transport-level failure, so the
             # fields stay empty rather than being filled with a guess.
             timings.mark_login_done()
-        log(f"Auth FAIL [{e}, {elapsed:.0f}ms]{_timing_suffix(timings)}", "ERROR")
+        safe_error = network_error_for_log(e)
+        log(f"Auth FAIL [{safe_error}, {elapsed:.0f}ms]{_timing_suffix(timings)}", "ERROR")
         # A transport-level failure is a network error: never eligible for the
         # conflict fast path, so it takes the regular backoff.
-        return False, result_for(False, RESULT_NETWORK_ERROR, message=str(e))
+        return False, result_for(False, RESULT_NETWORK_ERROR, message=safe_error)
 
 
 def do_auth_http(url, timeout):
@@ -1182,17 +1246,32 @@ def do_auth_http(url, timeout):
         body = e.read().decode("utf-8", errors="ignore") if e.fp else ""
         return e.code, body, f"HTTP error {e.code}"
     except Exception as e:
-        return None, str(e), str(e)
+        safe_error = network_error_for_log(e)
+        return None, "", safe_error
 
 
-def do_auth_browser(url, wait_seconds):
+def do_auth_browser(url, wait_seconds, cancelled=None):
+    if cancelled is not None and cancelled():
+        return False
     log("Opening portal URL in browser", "AUTH")
     webbrowser.open(url)
-    time.sleep(wait_seconds)
+    end = time.monotonic() + wait_seconds
+    while True:
+        if cancelled is not None and cancelled():
+            return False
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.1, remaining))
+    if cancelled is not None and cancelled():
+        return False
     simulate_enter()
+    return True
 
 
-def do_auth(config, last_auth_time, timings=None, result_out=None):
+def do_auth(config, last_auth_time, timings=None, result_out=None,
+            stop_event=None, deadline=None, recheck_after_lock=False,
+            submit_before=None):
     """Attempt authentication and confirm real connectivity.
 
     Returns a plain bool — every existing caller (CLI, GUI, tray) depends on
@@ -1210,6 +1289,20 @@ def do_auth(config, last_auth_time, timings=None, result_out=None):
         if result_out is not None:
             result_out.append(result)
         return ok
+
+    def cancelled():
+        return ((stop_event is not None and stop_event.is_set())
+                or (deadline is not None and datetime.now() >= deadline))
+
+    def cancelled_return(reason="attempt cancelled"):
+        if timings is not None:
+            timings.mark_finished()
+        return publish(False, AuthResult(False, RESULT_CANCELLED,
+                                         portal_message=reason,
+                                         timings=timings))
+
+    if cancelled():
+        return cancelled_return()
 
     now = datetime.now()
     cooldown = config.get("auth_cooldown_seconds", 3)
@@ -1230,56 +1323,81 @@ def do_auth(config, last_auth_time, timings=None, result_out=None):
     url = config.get("portal_url", "")
     timeout = config["request_timeout"]
 
-    # One attempt at a time inside this process. The GUI's manual-auth button
-    # can fire while the detection loop is mid-attempt, and two simultaneous
-    # submits to the portal is exactly the kind of overlap that can manufacture
-    # the session conflicts we are trying to measure. This is observation of
-    # the overlap (the counter is reported), not yet a prevention mechanism.
+    # Acquire interruptibly: a GUI click may be waiting behind the guard while
+    # the user stops it, or a scheduled run may reach its end time.
+    acquired = _AUTH_SUBMIT_LOCK.acquire(blocking=False)
+    waited_for_lock = not acquired
+    while not acquired:
+        if cancelled():
+            return cancelled_return()
+        if submit_before is not None and time.monotonic() >= submit_before:
+            return cancelled_return("fast reservation expired")
+        acquired = _AUTH_SUBMIT_LOCK.acquire(timeout=0.1)
+
     global _AUTH_IN_FLIGHT
-    with _AUTH_IN_FLIGHT_LOCK:
-        # The mutex guards only a counter, so its own wait is not a phase worth
-        # measuring. Restarting the timeline here keeps that brief wait out of
-        # discovery and out of the unaccounted residual.
-        if timings is not None:
-            timings.reboot_timeline()
-        _AUTH_IN_FLIGHT += 1
-        in_flight = _AUTH_IN_FLIGHT
     try:
-        if timings is not None and in_flight > 1:
-            timings.overlapping_auth = True
-        ok, result = _do_auth_inner(config, method, url, timeout, timings)
-        return publish(ok, result)
-    finally:
+        if cancelled():
+            return cancelled_return()
+        if submit_before is not None and time.monotonic() >= submit_before:
+            return cancelled_return("fast reservation expired")
+        # The other attempt may have restored connectivity while we waited.
+        if recheck_after_lock and waited_for_lock:
+            healthy, _detail = check_network(
+                config["check_url"], timeout, config.get("check_expected_body"))
+            if cancelled() or healthy:
+                return cancelled_return()
+        if submit_before is not None and time.monotonic() >= submit_before:
+            return cancelled_return("fast reservation expired")
         with _AUTH_IN_FLIGHT_LOCK:
-            _AUTH_IN_FLIGHT -= 1
-        if timings is not None:
+            # Lock waiting is not part of portal discovery or its residual.
+            if timings is not None:
+                timings.reboot_timeline()
+            _AUTH_IN_FLIGHT += 1
+        try:
+            ok, result = _do_auth_inner(config, method, url, timeout, timings,
+                                        cancelled)
+            return publish(ok, result)
+        finally:
+            with _AUTH_IN_FLIGHT_LOCK:
+                _AUTH_IN_FLIGHT -= 1
+    finally:
+        _AUTH_SUBMIT_LOCK.release()
+        if timings is not None and timings.finished_at is None:
             timings.mark_finished()
 
 
-def _do_auth_inner(config, method, url, timeout, timings):
+def _do_auth_inner(config, method, url, timeout, timings, cancelled=None):
     """The auth body, split out so do_auth can always close the timing record.
 
     Returns `(ok, result)`. `result` explains the outcome; for the http and
     browser modes the portal gives us nothing to classify, so the kind stays
     `unknown` and those modes take the regular backoff.
     """
+    if cancelled is not None and cancelled():
+        return False, AuthResult(False, RESULT_CANCELLED,
+                                 portal_message="attempt cancelled", timings=timings)
     if method == "browser":
-        do_auth_browser(url, config.get("browser_wait_seconds", 3))
+        if not do_auth_browser(url, config.get("browser_wait_seconds", 3), cancelled):
+            return False, AuthResult(False, RESULT_CANCELLED,
+                                     portal_message="attempt cancelled", timings=timings)
         log("Browser auth completed (Enter sent)", "AUTH")
         return _finish_by_verification(config, method, timings,
-                                       AuthResult(True, RESULT_UNKNOWN))
+                                       AuthResult(True, RESULT_UNKNOWN), cancelled)
     elif method != "portal_post":
-        return _do_auth_http_mode(config, url, timeout, timings)
+        return _do_auth_http_mode(config, url, timeout, timings, cancelled)
 
-    ok, result = do_auth_portal_post(config, timings)
+    ok, result = do_auth_portal_post(config, timings, cancelled)
     if not ok:
         return False, result
 
     # The portal accepted the credentials; connectivity still has to be proven.
-    return _finish_by_verification(config, method, timings, result)
+    return _finish_by_verification(config, method, timings, result, cancelled)
 
 
-def _do_auth_http_mode(config, url, timeout, timings):
+def _do_auth_http_mode(config, url, timeout, timings, cancelled=None):
+    if cancelled is not None and cancelled():
+        return False, AuthResult(False, RESULT_CANCELLED,
+                                 portal_message="attempt cancelled", timings=timings)
     start = time.time()
     if timings is not None:
         timings.mark_login_started()
@@ -1309,7 +1427,7 @@ def _do_auth_http_mode(config, url, timeout, timings):
         return _finish_by_verification(
             config, "http", timings,
             AuthResult(True, RESULT_UNKNOWN, http_status=status,
-                       http_requests_issued=requests, timings=timings))
+                       http_requests_issued=requests, timings=timings), cancelled)
     log(f"Auth FAIL [{info}, {elapsed:.0f}ms]{_timing_suffix(timings)}", "ERROR")
     kind = RESULT_NETWORK_ERROR if status is None else RESULT_UNKNOWN
     return False, AuthResult(False, kind, portal_message=info,
@@ -1317,7 +1435,7 @@ def _do_auth_http_mode(config, url, timeout, timings):
                              timings=timings)
 
 
-def _finish_by_verification(config, method, timings, result):
+def _finish_by_verification(config, method, timings, result, cancelled=None):
     """Shared tail: the portal's answer is not proof, so confirm connectivity.
 
     A portal that reports success while the network stays down is
@@ -1327,8 +1445,14 @@ def _finish_by_verification(config, method, timings, result):
 
     # The portal response alone does not establish Internet connectivity.
     for attempt in range(3):
+        if cancelled is not None and cancelled():
+            return False, AuthResult(False, RESULT_CANCELLED,
+                                     portal_message="attempt cancelled", timings=timings)
         if attempt:
             time.sleep(1)
+            if cancelled is not None and cancelled():
+                return False, AuthResult(False, RESULT_CANCELLED,
+                                         portal_message="attempt cancelled", timings=timings)
         if timings is not None:
             timings.verify_attempts += 1
         ok, detail = check_network(config["check_url"], timeout,
@@ -1879,20 +2003,18 @@ RESULT_NETWORK_ERROR = "network_error"
 RESULT_PORTAL_CONFIG_ERROR = "portal_config_error"
 RESULT_VERIFICATION_FAILED = "verification_failed"
 RESULT_UNKNOWN = "unknown"
+RESULT_CANCELLED = "cancelled"  # Internal stop/deadline, never a portal classification.
 
 _AUTH_KINDS = (
     RESULT_SESSION_CONFLICT, RESULT_CREDENTIAL_ERROR, RESULT_NETWORK_ERROR,
     RESULT_PORTAL_CONFIG_ERROR, RESULT_VERIFICATION_FAILED, RESULT_UNKNOWN,
+    RESULT_CANCELLED,
 )
 
-# Observed on this campus network, plus wording the portal family is known to
-# use. No generic substrings ("账号", "invalid"): "账号已在线" is a conflict, not
-# a credential problem, and guessing wrong sends a transient failure down the
-# long backoff.
+# A fast retry needs an observed, specific conflict signature. Generic session
+# failure wording must stay unknown and use the regular backoff.
 _SESSION_CONFLICT_MARKERS = (
     "mac collision",
-    "create session failed",
-    "会话冲突",
 )
 _CREDENTIAL_ERROR_MARKERS = (
     "密码错误", "密码不正确", "用户不存在", "用户名不存在", "账号不存在",
@@ -1978,12 +2100,12 @@ RETRY_BACKOFF = "backoff"
 class RetryDecision:
     """The delay to wait plus *why*, so the log can state the reason."""
 
-    __slots__ = ("delay", "reason", "fast_used")
+    __slots__ = ("delay", "reason", "is_fast")
 
-    def __init__(self, delay, reason, fast_used=0):
+    def __init__(self, delay, reason, is_fast=False):
         self.delay = delay
         self.reason = reason
-        self.fast_used = fast_used
+        self.is_fast = is_fast
 
     def __repr__(self):
         return f"RetryDecision(delay={self.delay}, reason={self.reason!r})"
@@ -2011,14 +2133,28 @@ class RetryPolicy:
 
     def __init__(self, config):
         self.config = config
-        self.fast_enabled = bool(config.get("auth_conflict_fast_enabled", False))
-        self.fast_seconds = max(
-            1, int(config.get("auth_conflict_retry_seconds",
-                              DEFAULT_CONFLICT_FAST_RETRY_SECONDS)))
-        self.max_fast = max(0, int(config.get("auth_conflict_max_fast_retries",
-                                              DEFAULT_CONFLICT_FAST_MAX_RETRIES)))
-        self.window = max(0, int(config.get("auth_conflict_fast_window_seconds",
-                                            DEFAULT_CONFLICT_FAST_WINDOW_SECONDS)))
+        enabled = config.get("auth_conflict_fast_enabled", False)
+        self.fast_enabled = enabled is True
+        self.config_error = ("auth_conflict_fast_enabled"
+                             if type(enabled) is not bool else None)
+
+        def bounded_int(name, default, minimum, maximum):
+            value = config.get(name, default)
+            # bool is an int in Python, but not a valid duration or count.
+            if type(value) is not int or not minimum <= value <= maximum:
+                if self.config_error is None:
+                    self.config_error = name
+                return default
+            return value
+
+        self.fast_seconds = bounded_int("auth_conflict_retry_seconds",
+                                        DEFAULT_CONFLICT_FAST_RETRY_SECONDS, 1, 60)
+        self.max_fast = bounded_int("auth_conflict_max_fast_retries",
+                                    DEFAULT_CONFLICT_FAST_MAX_RETRIES, 0, 50)
+        self.window = bounded_int("auth_conflict_fast_window_seconds",
+                                  DEFAULT_CONFLICT_FAST_WINDOW_SECONDS, 0, 300)
+        if self.config_error:
+            self.fast_enabled = False
 
     def fast_budget(self):
         """How many fast retries fit inside the window, and their total wait.
@@ -2029,7 +2165,9 @@ class RetryPolicy:
         """
         if not (self.fast_enabled and self.max_fast > 0 and self.window > 0):
             return None
-        count = min(self.max_fast, self.window // self.fast_seconds)
+        # A request exactly on the deadline is forbidden. This is only an
+        # ideal upper bound; request durations and probe cadence reduce it.
+        count = min(self.max_fast, (self.window - 1) // self.fast_seconds)
         if count <= 0:
             return None
         return {"count": count, "each": self.fast_seconds,
@@ -2042,7 +2180,9 @@ class RetryPolicy:
                           for offset in range(5))
         budget = self.fast_budget()
         if budget is None:
-            why = "disabled" if not self.fast_enabled else "configured to nothing usable"
+            why = (f"disabled: invalid {self.config_error}" if self.config_error
+                   else "disabled" if not self.fast_enabled
+                   else "configured to nothing usable")
             return f"conflict fast path {why}; regular backoff {chain}..."
         return (f"conflict fast path: up to {budget['count']} retries of "
                 f"{budget['each']}s within {budget['window']}s "
@@ -2052,7 +2192,8 @@ class RetryPolicy:
         return ", ".join(f"{auth_retry_delay(self.config, n)}s"
                          for n in range(1, steps + 1))
 
-    def decide(self, result, backoff_step, fast_used, seconds_since_first_conflict):
+    def decide(self, result, backoff_step, fast_used, seconds_since_first_conflict,
+               fast_budget_closed=False):
         """Return the RetryDecision for a failed attempt.
 
         `result.ok` False is assumed. `backoff_step` is the regular backoff
@@ -2064,26 +2205,28 @@ class RetryPolicy:
         if result.ok:
             raise ValueError("decide() is for failed attempts only")
 
-        if kind == RESULT_SESSION_CONFLICT and self.fast_enabled:
+        if kind == RESULT_SESSION_CONFLICT and self.fast_enabled and not fast_budget_closed:
             if (fast_used < self.max_fast
                     and seconds_since_first_conflict is not None
-                    and seconds_since_first_conflict < self.window):
+                    and seconds_since_first_conflict + self.fast_seconds < self.window):
                 return RetryDecision(
                     self.fast_seconds,
                     f"conflict fast retry {fast_used + 1}/{self.max_fast} "
                     f"within {self.window}s window",
-                    fast_used=fast_used + 1)
+                    is_fast=True)
 
         # Regular backoff, and the reason names the class so the log explains
         # why a conflict did not get the fast path when it did not.
-        reason = self._backoff_reason(kind, fast_used)
+        reason = self._backoff_reason(kind, fast_used, fast_budget_closed)
         return RetryDecision(auth_retry_delay(self.config, backoff_step), reason)
 
-    def _backoff_reason(self, kind, fast_used):
+    def _backoff_reason(self, kind, fast_used, fast_budget_closed):
         if kind != RESULT_SESSION_CONFLICT:
             return f"regular backoff: kind={kind} is not eligible for fast retry"
         if not self.fast_enabled:
             return "regular backoff: conflict fast path is disabled"
+        if fast_budget_closed:
+            return "regular backoff: fast budget already closed for this outage"
         if fast_used >= self.max_fast:
             return f"regular backoff: fast budget spent ({fast_used}/{self.max_fast})"
         return "regular backoff: fast window closed"
@@ -2115,6 +2258,7 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
         run_duration = duration_override
     is_tray = status_callback is not None
 
+    log(runtime_identity_line(), "START")
     log("Service started" + (" [tray]" if is_tray else " [interactive]" if INTERACTIVE else " [background]"), "START")
     log(f"Config: auth={config.get('auth_method','http')} check={check_url} interval={interval_ok}s threshold={fail_threshold} duration={run_duration}min", "INFO")
 
@@ -2149,6 +2293,9 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
     backoff_step = 1
     fast_used = 0
     first_conflict_at = None
+    fast_budget_closed = False
+    next_auth_is_fast = False
+    last_auth_finished_at = None
     # ── observation state (never feeds a decision) ──
     last_probe_ms = None
     planned_wait_ms = None
@@ -2204,6 +2351,10 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
                 backoff_step = 1
                 fast_used = 0
                 first_conflict_at = None
+                fast_budget_closed = False
+                next_auth_is_fast = False
+                last_auth_finished_at = None
+                next_auth_at = 0.0
                 first_failure_at = None
                 first_failure_monotonic = None
                 down_confirmed_monotonic = None
@@ -2242,53 +2393,105 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
                         auth_attempts = 0
 
                     if time.monotonic() >= next_auth_at:
-                        auth_attempts += 1
-                        timings = TimingRecord()
-                        timings.attempt_index = auth_attempts
-                        timings.mark_due(next_auth_at, planned_wait_ms)
-                        result_out = []
-                        authenticated = do_auth(config, None, timings, result_out)
-                        auth_result = result_out[0] if result_out else None
-                        clue = timings.clue_line()
-                        if clue:
-                            log(f"Attempt {auth_attempts} {clue}", "AUTH")
+                        if stop_event and stop_event.is_set():
+                            break
+                        if end_time and datetime.now() >= end_time:
+                            log("Run duration reached before auth, exiting", "STOP")
+                            break
 
-                        # The retry state machine. Every failure advances the
-                        # regular backoff step, and only an explicitly enabled
-                        # policy can turn a session conflict into a short wait.
-                        if authenticated:
-                            auth_failures = 0
-                            backoff_step = 1
-                            fast_used = 0
-                            first_conflict_at = None
-                            delay = auth_retry_delay(config, 1)
-                            reason = "success"
-                        else:
-                            auth_failures += 1
-                            kind = (auth_result.kind if auth_result is not None
-                                    else RESULT_UNKNOWN)
-                            if kind == RESULT_SESSION_CONFLICT:
-                                if first_conflict_at is None:
-                                    first_conflict_at = time.monotonic()
-                                elapsed = time.monotonic() - first_conflict_at
-                            else:
-                                elapsed = None
-                            decision = retry_policy.decide(
-                                auth_result if auth_result is not None
-                                else AuthResult(False, RESULT_UNKNOWN),
-                                backoff_step, fast_used, elapsed)
-                            delay = decision.delay
-                            reason = decision.reason
-                            if decision.fast_used:
-                                fast_used = decision.fast_used
-                            else:
-                                # Only a regular-backoff decision advances the
-                                # chain; a fast retry deliberately does not, so
-                                # a burst of them cannot reach the 300s cap.
+                        # A fast reservation is not permission to submit after
+                        # its deadline. Convert it to the regular chain without
+                        # consuming a fast attempt if a slow probe/lock made it
+                        # late. A regular attempt may run now if its own delay
+                        # has already elapsed since the last failure.
+                        if next_auth_is_fast:
+                            fast_deadline = (first_conflict_at + retry_policy.window
+                                             if first_conflict_at is not None else 0.0)
+                            if (fast_budget_closed or fast_used >= retry_policy.max_fast
+                                    or time.monotonic() >= fast_deadline):
+                                fast_budget_closed = True
+                                next_auth_is_fast = False
+                                delay = auth_retry_delay(config, backoff_step)
+                                next_auth_at = (last_auth_finished_at
+                                                if last_auth_finished_at is not None
+                                                else time.monotonic()) + delay
+                                planned_wait_ms = delay * 1000
                                 backoff_step += 1
-                        log(f"Retry in {delay}s ({reason})", "AUTH")
-                        planned_wait_ms = delay * 1000
-                        next_auth_at = time.monotonic() + delay
+                                log(f"Fast reservation expired; regular backoff {delay}s", "AUTH")
+
+                        if time.monotonic() >= next_auth_at:
+                            dispatching_fast = next_auth_is_fast
+                            auth_attempts += 1
+                            timings = TimingRecord()
+                            timings.attempt_index = auth_attempts
+                            timings.mark_due(next_auth_at, planned_wait_ms)
+                            result_out = []
+                            authenticated = do_auth(
+                                config, None, timings, result_out,
+                                stop_event=stop_event, deadline=end_time,
+                                recheck_after_lock=True,
+                                submit_before=(first_conflict_at + retry_policy.window
+                                               if dispatching_fast else None))
+                            auth_result = result_out[0] if result_out else None
+                            if (auth_result is not None
+                                    and auth_result.kind == RESULT_CANCELLED
+                                    and auth_result.portal_message == "fast reservation expired"):
+                                auth_attempts -= 1
+                                fast_budget_closed = True
+                                next_auth_is_fast = False
+                                delay = auth_retry_delay(config, backoff_step)
+                                next_auth_at = (last_auth_finished_at
+                                                if last_auth_finished_at is not None
+                                                else time.monotonic()) + delay
+                                planned_wait_ms = delay * 1000
+                                backoff_step += 1
+                                log(f"Fast reservation expired while waiting to submit; "
+                                    f"regular backoff {delay}s", "AUTH")
+                                continue
+                            if (auth_result is not None
+                                    and auth_result.kind == RESULT_CANCELLED):
+                                continue
+                            if dispatching_fast:
+                                fast_used += 1  # Count actual dispatch, not reservation.
+                                next_auth_is_fast = False
+                            last_auth_finished_at = time.monotonic()
+                            clue = timings.clue_line()
+                            if clue:
+                                log(f"Attempt {auth_attempts} {clue}", "AUTH")
+
+                            # Only a regular decision advances backoff_step.
+                            if authenticated:
+                                auth_failures = 0
+                                backoff_step = 1
+                                fast_used = 0
+                                first_conflict_at = None
+                                fast_budget_closed = False
+                                delay = auth_retry_delay(config, 1)
+                                reason = "success"
+                            else:
+                                auth_failures += 1
+                                kind = (auth_result.kind if auth_result is not None
+                                        else RESULT_UNKNOWN)
+                                if kind == RESULT_SESSION_CONFLICT:
+                                    if first_conflict_at is None:
+                                        first_conflict_at = time.monotonic()
+                                    elapsed = time.monotonic() - first_conflict_at
+                                else:
+                                    elapsed = None
+                                decision = retry_policy.decide(
+                                    auth_result if auth_result is not None
+                                    else AuthResult(False, RESULT_UNKNOWN),
+                                    backoff_step, fast_used, elapsed,
+                                    fast_budget_closed)
+                                delay = decision.delay
+                                reason = decision.reason
+                                next_auth_is_fast = decision.is_fast
+                                if not decision.is_fast:
+                                    fast_budget_closed = True
+                                    backoff_step += 1
+                            log(f"Retry in {delay}s ({reason})", "AUTH")
+                            planned_wait_ms = delay * 1000
+                            next_auth_at = time.monotonic() + delay
                 else:
                     log(f"Check #{fail_count} failed: {detail}", "WARN")
 
@@ -2323,7 +2526,7 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
             log("Service stopped by user", "STOP")
             break
         except Exception as e:
-            log(f"Unexpected error: {e}", "ERROR")
+            log(f"Unexpected error: {network_error_for_log(e)}", "ERROR")
             for _ in range(int(interval_fail * 2)):
                 if stop_event and stop_event.is_set():
                     break

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import re
 import sys
@@ -201,7 +202,7 @@ class AutoLoginTests(unittest.TestCase):
             # An unclassifiable failure takes the regular backoff.
             return app.RESULT_UNKNOWN
 
-        def fake_do_auth(config, last_auth_time, timings=None, result_out=None):
+        def fake_do_auth(config, last_auth_time, timings=None, result_out=None, **kwargs):
             kind = auth(config, last_auth_time, timings, result_out)
             if result_out is not None:
                 result_out.append(app.AuthResult(False, kind))
@@ -236,7 +237,7 @@ class AutoLoginTests(unittest.TestCase):
         def sleep(seconds):
             clock[0] += seconds
 
-        def fake_do_auth(config, last_auth_time, timings=None, result_out=None):
+        def fake_do_auth(config, last_auth_time, timings=None, result_out=None, **kwargs):
             attempts.append(clock[0])
             if len(attempts) >= 4:
                 stop.set()
@@ -267,7 +268,7 @@ class AutoLoginTests(unittest.TestCase):
         def sleep(seconds):
             clock[0] += seconds
 
-        def fake_do_auth(config, last_auth_time, timings=None, result_out=None):
+        def fake_do_auth(config, last_auth_time, timings=None, result_out=None, **kwargs):
             attempts.append(clock[0])
             if len(attempts) >= 3:
                 stop.set()
@@ -306,7 +307,7 @@ class AutoLoginTests(unittest.TestCase):
         def sleep(seconds):
             clock[0] += seconds
 
-        def fake_do_auth(cfg, last_auth_time, timings=None, result_out=None):
+        def fake_do_auth(cfg, last_auth_time, timings=None, result_out=None, **kwargs):
             attempts.append(clock[0])
             if len(attempts) >= 40:
                 stop.set()
@@ -339,6 +340,135 @@ class AutoLoginTests(unittest.TestCase):
                         "the fast window must close and hand over to the backoff")
         self.assertTrue(any("regular backoff" in line for line in lines))
         self.assertTrue(stop.is_set(), "the loop did not stop at the cap")
+
+    def test_other_failure_closes_fast_budget_for_the_outage(self):
+        config = dict(self.config, auth_conflict_fast_enabled=True)
+        stop, clock, attempts = threading.Event(), [0.0], []
+        kinds = [app.RESULT_SESSION_CONFLICT, app.RESULT_NETWORK_ERROR,
+                 app.RESULT_SESSION_CONFLICT, app.RESULT_SESSION_CONFLICT]
+
+        def auth(cfg, last_auth_time, timings=None, result_out=None, **kwargs):
+            attempts.append(clock[0])
+            result_out.append(app.AuthResult(False, kinds[len(attempts) - 1]))
+            if len(attempts) == len(kinds):
+                stop.set()
+            return False
+
+        with patch.object(app, "check_network", return_value=(False, "offline")), \
+             patch.object(app, "do_auth", side_effect=auth), \
+             patch.object(app.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(app.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)):
+            app.run_detection_loop(config, stop_event=stop)
+
+        self.assertEqual(len(attempts), 4)
+        # The 1s probe cadence adds one tick after each scheduled delay.
+        self.assertEqual([attempts[i] - attempts[i - 1] for i in range(1, 4)],
+                         [2, 4, 6])
+
+    def test_slow_probe_expires_fast_reservation_before_dispatch(self):
+        config = dict(self.config, auth_conflict_fast_enabled=True,
+                      auth_conflict_fast_window_seconds=5)
+        stop, clock, attempts, lines = threading.Event(), [0.0], [], []
+        checks = [0]
+
+        def probe(*args):
+            checks[0] += 1
+            if checks[0] == 3:
+                clock[0] += 10  # A due fast retry is now outside its window.
+            return False, "offline"
+
+        def auth(cfg, last_auth_time, timings=None, result_out=None, **kwargs):
+            attempts.append(clock[0])
+            result_out.append(app.AuthResult(False, app.RESULT_SESSION_CONFLICT))
+            if len(attempts) == 2:
+                stop.set()
+            return False
+
+        with patch.object(app, "log", side_effect=lambda msg, level="INFO": lines.append(msg)), \
+             patch.object(app, "check_network", side_effect=probe), \
+             patch.object(app, "do_auth", side_effect=auth), \
+             patch.object(app.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(app.time, "sleep", side_effect=lambda s: clock.__setitem__(0, clock[0] + s)):
+            app.run_detection_loop(config, stop_event=stop)
+
+        self.assertEqual(len(attempts), 2)
+        self.assertGreaterEqual(attempts[1] - attempts[0], 10)
+        self.assertTrue(any("Fast reservation expired" in line for line in lines))
+
+    def test_fast_deadline_is_checked_again_after_submit_lock_wait(self):
+        record, results = app.TimingRecord(), []
+        started = threading.Event()
+        app._AUTH_SUBMIT_LOCK.acquire()
+        try:
+            def worker():
+                started.set()
+                app.do_auth(self.config, None, record, results,
+                            submit_before=time.monotonic() + 0.02)
+
+            with patch.object(app, "do_auth_portal_post") as post:
+                thread = threading.Thread(target=worker)
+                thread.start()
+                self.assertTrue(started.wait(timeout=2))
+                thread.join(timeout=2)
+                self.assertFalse(thread.is_alive())
+                post.assert_not_called()
+        finally:
+            app._AUTH_SUBMIT_LOCK.release()
+        self.assertEqual(results[0].kind, app.RESULT_CANCELLED)
+        self.assertEqual(results[0].portal_message, "fast reservation expired")
+        self.assertIsNotNone(record.total_ms)
+
+    def test_stop_before_submission_skips_portal_post(self):
+        stopped = threading.Event()
+        stopped.set()
+        record, results = app.TimingRecord(), []
+        with patch.object(app, "do_auth_portal_post") as post:
+            self.assertFalse(app.do_auth(self.config, None, record, results,
+                                         stop_event=stopped))
+            post.assert_not_called()
+        self.assertEqual(results[0].kind, app.RESULT_CANCELLED)
+        self.assertIsNotNone(record.total_ms)
+
+    def test_stop_during_browser_wait_does_not_send_enter(self):
+        stopped = threading.Event()
+        config = dict(self.config, auth_method="browser", browser_wait_seconds=3)
+        results = []
+
+        def sleep(_seconds):
+            stopped.set()
+
+        with patch.object(app.webbrowser, "open") as browser, \
+             patch.object(app, "simulate_enter") as enter, \
+             patch.object(app.time, "sleep", side_effect=sleep):
+            ok = app.do_auth(config, None, app.TimingRecord(), results,
+                             stop_event=stopped)
+        self.assertFalse(ok)
+        browser.assert_called_once()
+        enter.assert_not_called()
+        self.assertEqual(results[0].kind, app.RESULT_CANCELLED)
+
+    def test_waiting_for_other_auth_rechecks_network_before_submit(self):
+        class OnceContendedLock:
+            def __init__(self):
+                self.released = False
+
+            def acquire(self, blocking=True, timeout=-1):
+                return blocking  # First nonblocking attempt fails; timed one succeeds.
+
+            def release(self):
+                self.released = True
+
+        lock, results = OnceContendedLock(), []
+        with patch.object(app, "_AUTH_SUBMIT_LOCK", lock), \
+             patch.object(app, "check_network", return_value=(True, "OK")) as check, \
+             patch.object(app, "do_auth_portal_post") as post:
+            ok = app.do_auth(self.config, None, app.TimingRecord(), results,
+                             recheck_after_lock=True)
+        self.assertFalse(ok)
+        self.assertTrue(lock.released)
+        check.assert_called_once()
+        post.assert_not_called()
+        self.assertEqual(results[0].kind, app.RESULT_CANCELLED)
 
     def test_retry_delay_progression_and_cap(self):
         self.assertEqual([app.auth_retry_delay(self.config, n) for n in range(1, 10)],
@@ -401,6 +531,19 @@ class AttemptTimingTests(unittest.TestCase):
         self.assertIn("post 200ms", suffix)
         self.assertIn("verify 1.5s", suffix)
         self.assertIn("total 2.3s", suffix)
+
+    def test_submit_lock_wait_is_lateness_not_discovery(self):
+        with patch.object(app.time, "monotonic", side_effect=lambda: self.clock[0]):
+            record = app.TimingRecord()
+            record.mark_due(99.0, 1000)
+            self._advance(2.0)  # Waiting behind another authentication.
+            record.reboot_timeline()
+            self._advance(0.4)
+            record.mark_discovery_done()
+            record.mark_finished()
+        self.assertAlmostEqual(record.retry_lateness_ms, 3000)
+        self.assertAlmostEqual(record.discovery_ms, 400)
+        self.assertAlmostEqual(record.total_ms, 400)
 
     def test_login_post_ms_is_absent_when_the_post_never_started(self):
         # Discovery failed before any POST: the POST phase is "not measured",
@@ -613,16 +756,14 @@ class AttemptTimingTests(unittest.TestCase):
         self.assertNotIn("lock", suffix)
 
     def test_concurrent_attempts_keep_the_accounting_sane(self):
-        """Two overlapping attempts must leave the counter clean and every
-        record measurable. Overlap detection itself is covered by the
-        dedicated overlapping_auth tests; this one is about the accounting
-        surviving concurrent use.
+        """Two simultaneous callers must be serialized, leave the counter
+        clean and keep both timing records measurable.
         """
         records = []
         holding = threading.Event()
         abort = threading.Event()
 
-        def slow(cfg, timings=None):
+        def slow(cfg, timings=None, cancelled=None):
             records.append(timings)
             if len(records) == 1:
                 holding.set()
@@ -640,6 +781,7 @@ class AttemptTimingTests(unittest.TestCase):
             self.assertTrue(holding.wait(timeout=5), "holder never entered")
             threads[1].start()
             time.sleep(0.02)
+            self.assertEqual(len(records), 1, "second submission must wait")
             abort.set()
             for thread in threads:
                 thread.join(timeout=10)
@@ -654,9 +796,7 @@ class AttemptTimingTests(unittest.TestCase):
                 self.assertGreaterEqual(record.unaccounted_ms, -0.001)
 
     def test_lock_wait_is_not_a_reported_phase(self):
-        # The auth mutex guards only a counter, so its wait has no analytical
-        # value and must not appear as a phase. It is absorbed by the timeline
-        # reboot instead, which is why the residual stays tiny in normal runs.
+        # Waiting for the submit lock is excluded from portal discovery.
         self.assertFalse(hasattr(app.TimingRecord, "lock_wait_ms"))
         self.assertNotIn("lock", app._timing_suffix(app.TimingRecord()))
 
@@ -681,6 +821,52 @@ class AttemptTimingTests(unittest.TestCase):
         # An unreachable index page is a network problem, never a conflict, so it
         # can never enter the conflict fast path.
         self.assertEqual(result.kind, app.RESULT_NETWORK_ERROR)
+
+    def test_network_exception_text_cannot_leak_a_short_session_token(self):
+        token = "Ab3xK9mQ2pL7v"
+        error = app.urllib.error.URLError(
+            f"failed at https://portal.example/index.jsp?session={token}")
+        with patch.object(app.urllib.request, "urlopen", side_effect=error):
+            ok, detail = app.check_network(self.config["check_url"], 1)
+        self.assertFalse(ok)
+        self.assertNotIn(token, detail)
+
+        logged = []
+        opener = Mock()
+        opener.open.side_effect = error
+        with patch.object(app, "log", side_effect=lambda msg, level="INFO": logged.append(msg)), \
+             patch.object(app.urllib.request, "build_opener", return_value=opener):
+            ok, result = app.do_auth_portal_post(self.config, app.TimingRecord())
+        self.assertFalse(ok)
+        self.assertNotIn(token, "\n".join(logged))
+        self.assertNotIn(token, result.describe())
+
+        with patch.object(app.urllib.request, "urlopen", side_effect=error):
+            status, body, info = app.do_auth_http(self.config["portal_url"], 1)
+        self.assertIsNone(status)
+        self.assertNotIn(token, body + info)
+
+    def test_stop_during_discovery_prevents_login_post(self):
+        stopped = threading.Event()
+        probe = Mock()
+        probe.geturl.return_value = self.config["check_url"]
+
+        def read_probe(*args):
+            stopped.set()
+            return b"location.href='/eportal/index.jsp?wlanuserip=10.0.0.1'"
+
+        probe.read.side_effect = read_probe
+        opener = Mock()
+        opener.open.return_value = probe
+        record = app.TimingRecord()
+        with patch.object(app.urllib.request, "build_opener", return_value=opener):
+            ok, result = app.do_auth_portal_post(
+                self.config, record, cancelled=stopped.is_set)
+        self.assertFalse(ok)
+        self.assertEqual(result.kind, app.RESULT_CANCELLED)
+        self.assertEqual(opener.open.call_count, 1)
+        self.assertIsNotNone(record.discovery_ms)
+        self.assertIsNone(record.login_post_ms)
 
     def test_discovery_urls_are_redacted(self):
         # index.jsp query strings carry wlanuserip/nasip session parameters, so
@@ -736,20 +922,24 @@ class AttemptTimingTests(unittest.TestCase):
         self.assertNotIn("66323863616466663861643538326666", joined)
 
     def test_overlapping_auth_is_measured_not_assumed(self):
-        # Two attempts in flight at once is a *definite* self-inflicted cause,
-        # so it has to be observed. A single attempt must not report it.
+        # A single attempt must not report an actual overlapping submission.
         solo = app.TimingRecord()
         with patch.object(app, "do_auth_portal_post", return_value=portal_post_result(False)):
             app.do_auth(self.config, None, solo)
         self.assertFalse(solo.overlapping_auth)
 
-    def test_two_concurrent_attempts_are_flagged_as_overlapping(self):
+    def test_two_concurrent_attempts_are_serialized(self):
         first = app.TimingRecord()
         second = app.TimingRecord()
-        entered = threading.Barrier(2, timeout=5)
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
 
-        def slow_attempt(cfg, timings=None):
-            entered.wait()          # both attempts are now inside do_auth
+        def slow_attempt(cfg, timings=None, cancelled=None):
+            calls.append(timings)
+            if len(calls) == 1:
+                entered.set()
+                release.wait(timeout=5)
             return portal_post_result(False)
 
         def run(record):
@@ -758,15 +948,19 @@ class AttemptTimingTests(unittest.TestCase):
         with patch.object(app, "do_auth_portal_post", side_effect=slow_attempt):
             threads = [threading.Thread(target=run, args=(r,))
                        for r in (first, second)]
-            for thread in threads:
-                thread.start()
+            threads[0].start()
+            self.assertTrue(entered.wait(timeout=5))
+            threads[1].start()
+            time.sleep(0.02)
+            self.assertEqual(len(calls), 1)
+            release.set()
             for thread in threads:
                 thread.join(timeout=10)
 
-        # The barrier guarantees both are inside do_auth before either reads the
-        # counter, so exactly one of them must observe the other.
-        self.assertTrue(first.overlapping_auth or second.overlapping_auth)
-        self.assertFalse(first.overlapping_auth and second.overlapping_auth)
+        self.assertEqual(len(calls), 2)
+        self.assertFalse(first.overlapping_auth)
+        self.assertFalse(second.overlapping_auth)
+        self.assertEqual(app._AUTH_IN_FLIGHT, 0)
 
     def test_in_flight_counter_returns_to_zero_after_failures(self):
         # A leaked counter would flag every later attempt as overlapping.
@@ -881,7 +1075,7 @@ class AttemptTimingTests(unittest.TestCase):
         def fake_sleep(seconds):
             real_sleep(0.001)
 
-        def auth(cfg, last_auth_time, timings=None, result_out=None):
+        def auth(cfg, last_auth_time, timings=None, result_out=None, **kwargs):
             attempts.append(timings)
             timings.mark_discovery_done()
             timings.count_request()
@@ -968,7 +1162,7 @@ class AttemptTimingTests(unittest.TestCase):
                 stop.set()
             return result
 
-        def fake_auth(cfg, last_auth_time, timings=None, result_out=None):
+        def fake_auth(cfg, last_auth_time, timings=None, result_out=None, **kwargs):
             timings.portal_result = "fail"
             timings.portal_message = "create session failed(mac collision)!"
             timings.mark_discovery_done()
@@ -1044,7 +1238,8 @@ class AuthClassificationTests(unittest.TestCase):
                          app.RESULT_UNKNOWN)
 
     def test_empty_and_unrecognised_messages_stay_unknown(self):
-        for message in ("", None, "something new the portal started saying"):
+        for message in ("", None, "something new the portal started saying",
+                        "create session failed", "会话冲突"):
             with self.subTest(message=message):
                 self.assertEqual(app.classify_portal_failure(message),
                                  app.RESULT_UNKNOWN)
@@ -1083,6 +1278,41 @@ class AuthClassificationTests(unittest.TestCase):
             policy.decide(self.result(app.RESULT_SESSION_CONFLICT), 1, 0, 0).delay,
             app.auth_retry_delay(config, 1))
 
+    def test_non_boolean_enable_flag_never_enables_fast_retry(self):
+        for value in ("true", "false", 1, None, []):
+            with self.subTest(value=value):
+                policy = app.RetryPolicy(dict(self.config,
+                                              auth_conflict_fast_enabled=value))
+                self.assertFalse(policy.fast_enabled)
+                self.assertIn("invalid auth_conflict_fast_enabled",
+                              policy.describe_budget())
+
+    def test_invalid_budget_values_fail_closed_without_crashing(self):
+        for name, value in (("auth_conflict_retry_seconds", "1"),
+                            ("auth_conflict_retry_seconds", 0),
+                            ("auth_conflict_max_fast_retries", -1),
+                            ("auth_conflict_max_fast_retries", 500),
+                            ("auth_conflict_fast_window_seconds", "25"),
+                            ("auth_conflict_fast_window_seconds", True)):
+            with self.subTest(name=name, value=value):
+                config = dict(self.config, auth_conflict_fast_enabled=True,
+                              **{name: value})
+                policy = app.RetryPolicy(config)
+                self.assertFalse(policy.fast_enabled)
+                self.assertIsNone(policy.fast_budget())
+                self.assertEqual(policy.decide(
+                    self.result(app.RESULT_SESSION_CONFLICT), 1, 0, 0).delay,
+                    app.auth_retry_delay(config, 1))
+
+    def test_runtime_identity_matches_current_source_bytes(self):
+        path = os.path.abspath(app.__file__)
+        with open(path, "rb") as source:
+            expected_hash = hashlib.sha256(source.read()).hexdigest()
+        line = app.runtime_identity_line()
+        self.assertIn(f"version={app.VERSION}", line)
+        self.assertIn(f"path={path}", line)
+        self.assertIn(f"sha256={expected_hash}", line)
+
     def test_enabling_it_is_explicit_and_then_used(self):
         config = dict(self.config, auth_conflict_fast_enabled=True)
         policy = app.RetryPolicy(config)
@@ -1108,7 +1338,7 @@ class AuthClassificationTests(unittest.TestCase):
                       auth_conflict_retry_seconds=2,
                       auth_conflict_max_fast_retries=50,
                       auth_conflict_fast_window_seconds=10)
-        self.assertEqual(app.RetryPolicy(config).fast_budget()["count"], 5)
+        self.assertEqual(app.RetryPolicy(config).fast_budget()["count"], 4)
 
     def test_spent_budget_falls_back_to_the_regular_chain(self):
         config = dict(self.config, auth_conflict_fast_enabled=True,
@@ -1117,7 +1347,7 @@ class AuthClassificationTests(unittest.TestCase):
         self.assertEqual(
             policy.decide(self.result(app.RESULT_SESSION_CONFLICT), 1, 2, 0).delay,
             app.auth_retry_delay(config, 1))
-        self.assertIn("budget spent", 
+        self.assertIn("budget spent",
                       policy.decide(self.result(app.RESULT_SESSION_CONFLICT), 1, 2, 0).reason)
 
     def test_window_boundary_is_exclusive(self):
@@ -1126,9 +1356,12 @@ class AuthClassificationTests(unittest.TestCase):
         config = dict(self.config, auth_conflict_fast_enabled=True,
                       auth_conflict_fast_window_seconds=25)
         policy = app.RetryPolicy(config)
-        inside = policy.decide(self.result(app.RESULT_SESSION_CONFLICT), 1, 0, 24.9)
+        inside = policy.decide(self.result(app.RESULT_SESSION_CONFLICT), 1, 0, 23.9)
+        too_late_to_schedule = policy.decide(
+            self.result(app.RESULT_SESSION_CONFLICT), 1, 0, 24.9)
         outside = policy.decide(self.result(app.RESULT_SESSION_CONFLICT), 1, 0, 25)
         self.assertEqual(inside.delay, 1)
+        self.assertEqual(too_late_to_schedule.delay, app.auth_retry_delay(config, 1))
         self.assertEqual(outside.delay, app.auth_retry_delay(config, 1))
         self.assertIn("window closed", outside.reason)
 
