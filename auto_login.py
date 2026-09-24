@@ -20,7 +20,7 @@ if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "v1.7.6-b-candidate.20260922.1"
+VERSION = "v2.0"
 
 
 def runtime_identity_line():
