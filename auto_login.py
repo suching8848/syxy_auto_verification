@@ -9,7 +9,9 @@ import os
 import sys
 import glob
 import hashlib
+import ipaddress
 import ctypes
+from ctypes import wintypes
 import argparse
 import re
 import socket
@@ -20,7 +22,7 @@ if getattr(sys, "frozen", False):
     SCRIPT_DIR = os.path.dirname(sys.executable)
 else:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-VERSION = "v2.0"
+VERSION = "v2.0.3"
 
 
 def runtime_identity_line():
@@ -397,6 +399,118 @@ _AUTH_IN_FLIGHT_LOCK = threading.Lock()
 # Protect the entire request/verification path, not just the observation counter.
 # A GUI click and the guard must never submit to the portal at the same time.
 _AUTH_SUBMIT_LOCK = threading.Lock()
+
+
+# All launch modes and installation folders must share the same guard.  The
+# Global namespace also includes scheduled tasks running in another session.
+GUARD_MUTEX_NAME = r"Global\CampusNet.AutoLogin.Guard"
+_GUARD_LOCAL_GATES = {}
+_GUARD_LOCAL_GATES_LOCK = threading.Lock()
+
+
+class _GuardSecurityAttributes(ctypes.Structure):
+    _fields_ = [("nLength", wintypes.DWORD),
+                ("lpSecurityDescriptor", wintypes.LPVOID),
+                ("bInheritHandle", wintypes.BOOL)]
+
+
+class GuardInstanceLock:
+    """Nonblocking, machine-wide guard lease, owned by the calling thread.
+
+    Windows mutexes are recursive, so a separate Python gate also rejects a
+    second loop on the same thread.  The kernel releases ownership if a process
+    dies; there is no PID file or stale marker for the user to clean up.
+    """
+
+    def __init__(self, name=None):
+        self.name = GUARD_MUTEX_NAME if name is None else name
+        with _GUARD_LOCAL_GATES_LOCK:
+            self._gate = _GUARD_LOCAL_GATES.setdefault(self.name, threading.Lock())
+        self._handle = None
+        self._owner_thread = None
+        self._kernel32 = None
+
+    def _create_mutex(self):
+        if os.name != "nt":
+            raise OSError("CampusNet guard requires Windows named mutex support")
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        kernel32.CreateMutexExW.argtypes = [ctypes.POINTER(_GuardSecurityAttributes),
+                                            wintypes.LPCWSTR, wintypes.DWORD,
+                                            wintypes.DWORD]
+        kernel32.CreateMutexExW.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+        kernel32.ReleaseMutex.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+        kernel32.LocalFree.restype = wintypes.HLOCAL
+        convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+        convert.argtypes = [wintypes.LPCWSTR, wintypes.DWORD,
+                            ctypes.POINTER(wintypes.LPVOID),
+                            ctypes.POINTER(wintypes.DWORD)]
+        convert.restype = wintypes.BOOL
+        self._kernel32 = kernel32
+
+        # Both SYSTEM/elevated tasks and ordinary desktop users can wait/release.
+        # CreateMutexEx requests only these two rights, never MUTEX_ALL_ACCESS.
+        # A medium integrity label lets a desktop user open a task-created lock.
+        descriptor = wintypes.LPVOID()
+        if not convert("D:(A;;0x00100001;;;WD)S:(ML;;NW;;;ME)", 1,
+                       ctypes.byref(descriptor), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            attributes = _GuardSecurityAttributes(
+                ctypes.sizeof(_GuardSecurityAttributes), descriptor, False)
+            handle = kernel32.CreateMutexExW(
+                ctypes.byref(attributes), self.name, 0, 0x00100001)
+            if not handle:
+                raise ctypes.WinError(ctypes.get_last_error())
+            return handle
+        finally:
+            kernel32.LocalFree(descriptor)
+
+    def acquire(self):
+        """Return False when busy; an OS error must never allow a second loop."""
+        if not self._gate.acquire(blocking=False):
+            return False
+        handle = None
+        acquired = False
+        try:
+            handle = self._create_mutex()
+            result = self._kernel32.WaitForSingleObject(handle, 0)
+            if result == 0x00000102:  # WAIT_TIMEOUT: an existing guard owns it.
+                return False
+            if result not in (0, 0x00000080):  # Also accept WAIT_ABANDONED.
+                if result == 0xFFFFFFFF:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                raise OSError("Unexpected guard mutex wait result")
+            self._handle = handle
+            self._owner_thread = threading.get_ident()
+            acquired = True
+            return True
+        finally:
+            if not acquired:
+                if handle:
+                    self._kernel32.CloseHandle(handle)
+                self._gate.release()
+
+    def release(self):
+        if self._handle is None:
+            return
+        if self._owner_thread != threading.get_ident():
+            raise RuntimeError("The guard lease must be released by its owner thread")
+        handle = self._handle
+        try:
+            if not self._kernel32.ReleaseMutex(handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            self._kernel32.CloseHandle(handle)
+            self._handle = None
+            self._owner_thread = None
+            self._gate.release()
 
 
 def _metric_ms(started_at, finished_at):
@@ -843,9 +957,108 @@ class TimingRecord:
 
 
 
+def open_direct(request, timeout):
+    """Open an HTTP request without the system/Windows proxy.
+
+    A captive portal can only be observed directly. With a local HTTP proxy
+    (Clash, v2ray, a debugging proxy) in front, this code would inspect the
+    proxy's own failure — or a remote node's answer — instead of the portal's
+    interception page, so "network down" and "proxy broken" become
+    indistinguishable. On 2026-10-28 a proxy teardown left every check timing
+    out while the browser was online; the portal login path had the same
+    problem. Both now go direct.
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(request, timeout=timeout)
+
+
+# Clash/v2ray TUN stacks hand out addresses from the benchmark range as
+# fake-ip / tunnel addresses (198.18.0.1 here). Sending one to the portal as
+# wlanuserip can only produce "WEB认证设备未注册".
+_TUN_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+
+
+def _log_network_path(config):
+    """Record the request path the checks use, once per run.
+
+    The checks and the portal login deliberately bypass the system proxy, but
+    they do NOT bypass an IP-layer TUN. A proxy or TUN being switched mid-run
+    is the first thing to rule out when a check disagrees with what the
+    browser can do, so both the proxy and the portal-facing source address
+    belong in the log.
+    """
+    try:
+        proxies = urllib.request.getproxies()
+    except Exception:
+        proxies = {}
+    proxy = proxies.get("http") or proxies.get("https")
+    if proxy:
+        split = urlsplit(proxy if "://" in proxy else "http://" + proxy)
+        where = split.hostname or "?"
+        if split.port:
+            where = f"{where}:{split.port}"
+        log(f"System proxy {where} is configured; connectivity checks and "
+            f"portal login bypass it", "INFO")
+    host = urlparse(config.get("portal_url", "")).hostname
+    if not host:
+        return
+    local_ip = local_route_address(host)
+    if not local_ip:
+        return
+    note = ""
+    if not usable_portal_client_ip(local_ip):
+        note = " (tunnel/reserved: portal detection may be affected)"
+    log(f"Route to portal {host} uses source address {local_ip}{note}", "INFO")
+
+
+def usable_portal_client_ip(value):
+    """True only for an address the campus portal could recognise as us.
+
+    `socket.getsockname()` reports the source address of the *route*, which
+    behind a TUN is the tunnel's own address, not the campus IP the BRAS
+    knows. Used for diagnostics only: no login is ever built from it.
+    """
+    try:
+        address = ipaddress.ip_address(str(value))
+    except ValueError:
+        return False
+    if address.version != 4:
+        return False
+    if address.is_loopback or address.is_link_local or address.is_unspecified:
+        return False
+    if address.is_multicast or address.is_reserved:
+        return False
+    return address not in _TUN_FAKE_IP_NETWORK
+
+
+def local_route_address(host, timeout=2):
+    """Source address the OS would use to reach `host`, or "" when unknown.
+
+    Diagnostic only. Behind a TUN this is the tunnel address (198.18.0.1
+    here); the portal cannot map it to a BRAS, so it must never be sent as
+    wlanuserip.
+    """
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    except OSError:
+        return ""
+    try:
+        probe.settimeout(timeout)
+        probe.connect((host, 80))
+        return probe.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        probe.close()
+
+
 def check_network(url, timeout, expected_body=None):
     """Returns (ok: bool, detail: str).
     Checks for captive portal via URL redirect AND response body content.
+
+    The request goes out without the system proxy and with the same browser
+    headers the portal login uses, so a check and a browser that disagree can
+    only mean a real network difference.
 
     Same-site http->https upgrades (e.g. baidu.com 301 to https) are normal
     and must NOT be treated as a portal redirect, otherwise a healthy network
@@ -853,8 +1066,8 @@ def check_network(url, timeout, expected_body=None):
     every post-auth verification fail."""
     expected = urlparse(url)
     try:
-        req = urllib.request.Request(url, method="GET")
-        resp = urllib.request.urlopen(req, timeout=timeout)
+        req = urllib.request.Request(url, headers=BROWSER_HEADERS, method="GET")
+        resp = open_direct(req, timeout)
         final_url = resp.geturl()
         final = urlparse(final_url)
         same_site = (
@@ -1032,8 +1245,12 @@ def do_auth_portal_post(config, timings=None, cancelled=None):
         return False, result_for(False, RESULT_CREDENTIAL_ERROR)
 
     cj = http.cookiejar.CookieJar()
+    # Direct, like the connectivity check: a local proxy would answer discovery
+    # itself and the BRAS would never get the chance to send its parameterised
+    # redirect.
     opener = urllib.request.build_opener(
         urllib.request.HTTPCookieProcessor(cj),
+        urllib.request.ProxyHandler({}),
     )
 
     def _count():
@@ -1145,27 +1362,32 @@ def do_auth_portal_post(config, timings=None, cancelled=None):
                 query_string = "&".join(f"{k}={v}" for k, v in js_params)
                 log(f"Extracted JS params from page body: {query_param_names(query_string)}", "AUTH")
 
-    # Step 1.7: last resort — construct minimal queryString from local IP
+    # Step 1.7: no portal-provided parameters. A login built from the local
+    # address alone is NOT submitted: measured on 10-23 and 10-28, every such
+    # request was rejected with "WEB认证设备未注册" — a bare wlanuserip cannot
+    # tell the portal which BRAS the client sits behind, so it can only burn
+    # the run window. The address is recorded for diagnosis instead.
     if not query_string:
         aborted = abort_if_needed()
         if aborted is not None:
             return aborted
-        try:
-            parsed = urlparse(portal_host)
-            host = parsed.hostname or portal_host
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(2)
-            s.connect((host, 80))
-            local_ip = s.getsockname()[0]
-            s.close()
-            if timings is not None:
-                # A raw socket probe, not an HTTP request: counted separately so
-                # the HTTP request count stays an honest number.
-                timings.socket_probes += 1
-            query_string = f"wlanuserip={local_ip}"
-            log(f"Fallback queryString: {query_param_names(query_string)}", "AUTH")
-        except Exception as e:
-            log(f"Could not construct queryString: {network_error_for_log(e)}", "AUTH")
+        parsed = urlparse(portal_host)
+        host = parsed.hostname or portal_host
+        local_ip = local_route_address(host)
+        if local_ip and timings is not None:
+            # A raw socket probe, not an HTTP request: counted separately so
+            # the HTTP request count stays an honest number.
+            timings.socket_probes += 1
+        route_note = f"local route address {local_ip or 'unknown'}"
+        if local_ip and not usable_portal_client_ip(local_ip):
+            route_note += ", tunnel/reserved"
+        if timings is not None:
+            timings.mark_discovery_done()
+        log("Portal did not provide login parameters (no BRAS redirect); "
+            "skipping this login instead of submitting a bare wlanuserip "
+            f"({route_note})", "WARN")
+        return False, result_for(False, RESULT_PORTAL_CONFIG_ERROR,
+                                 message="portal did not provide login parameters")
 
     if timings is not None:
         timings.mark_discovery_done()
@@ -2235,6 +2457,32 @@ class RetryPolicy:
 
 def run_detection_loop(config, stop_event=None, status_callback=None,
                        duration_override=None):
+    """Run one guard per machine; a competing launch exits without probing.
+
+    Only active guarding owns the lease: opening the GUI or waiting for a silent
+    start time does not prevent another launch from guarding in the meantime.
+    """
+    lease = GuardInstanceLock()
+    try:
+        acquired = lease.acquire()
+    except OSError as error:
+        log(f"Guard lock unavailable; monitoring was not started: "
+            f"{network_error_for_log(error)}", "GUARD")
+        raise
+    if not acquired:
+        log("Another guard is already running; this launch was skipped", "GUARD")
+        return False
+    try:
+        _run_detection_loop(config, stop_event=stop_event,
+                            status_callback=status_callback,
+                            duration_override=duration_override)
+        return True
+    finally:
+        lease.release()
+
+
+def _run_detection_loop(config, stop_event=None, status_callback=None,
+                        duration_override=None):
     """Core detection loop — runs until stopped or duration exceeded.
 
     Keeps probing check_url and re-authenticates as soon as the portal blocks
@@ -2261,6 +2509,7 @@ def run_detection_loop(config, stop_event=None, status_callback=None,
     log(runtime_identity_line(), "START")
     log("Service started" + (" [tray]" if is_tray else " [interactive]" if INTERACTIVE else " [background]"), "START")
     log(f"Config: auth={config.get('auth_method','http')} check={check_url} interval={interval_ok}s threshold={fail_threshold} duration={run_duration}min", "INFO")
+    _log_network_path(config)
 
     start_time = datetime.now()
     end_time = start_time + timedelta(minutes=run_duration) if run_duration > 0 else None
@@ -2653,7 +2902,12 @@ def run_silent_mode(run_minutes=None, interactive_launch=False):
     if window is None:
         log("Silent mode requested but silent_start_time is not set "
             "(expected \"HH:MM\") — falling back to a plain background run", "WARN")
-        run_detection_loop(config, duration_override=run_minutes)
+        try:
+            run_detection_loop(config, duration_override=run_minutes)
+        except OSError:
+            # The guard entry already logged the lock error.  A windowed silent
+            # build must exit with failure rather than show a traceback dialog.
+            return 1
         return 0
 
     start_at, end_at, wait_seconds = window
@@ -2685,7 +2939,10 @@ def run_silent_mode(run_minutes=None, interactive_launch=False):
     if run_minutes is None:
         run_minutes = max(1, int(round((end_at - start_at).total_seconds() / 60)))
     log("Silent window open — probing for connectivity, will re-auth on outage", "START")
-    run_detection_loop(config, duration_override=run_minutes)
+    try:
+        run_detection_loop(config, duration_override=run_minutes)
+    except OSError:
+        return 1
     log("Silent window ended, exiting", "STOP")
     return 0
 

@@ -2304,9 +2304,17 @@ def humanize(line):
     if not line:
         return None
     line = _TS_PREFIX.sub("", line).strip()
+    if "Another guard is already running; this launch was skipped" in line:
+        return "已有校园网守护正在运行，本次未启动。"
+    if "Portal did not provide login parameters" in line:
+        return "门户没有下发登录参数，本次未自动提交；可手动打开认证页登录。"
+    if "Route to portal" in line and "tunnel/reserved" in line:
+        return "访问门户的流量经过代理/TUN，断网探测可能受影响。"
     if "Auth OK [" in line:
         return "认证请求已提交，正在确认网络…"
     if "Auth FAIL [" in line:
+        if "设备未注册" in line or "参数配置" in line:
+            return "门户拒绝了登录：设备未注册（认证参数不匹配），需要检查门户侧或手动登录。"
         return "认证请求被拒绝，学号或密码可能不对"
     if "Network restored" in line:
         m = _DURATION.search(line)
@@ -2599,6 +2607,7 @@ class GuiApp:
         self._state = STATE_IDLE
         self._monitor = None            # 守护线程
         self._monitor_stop = None
+        self._monitor_blocked = None     # 被其他守护拒绝的会话标记
         self._auth_thread = None
         self._session_start = None      # 本次守护开始的时间
         self._last_check_at = None
@@ -2701,11 +2710,12 @@ class GuiApp:
                 pass
             return
         self._monitor_stop = threading.Event()
+        self._monitor_blocked = None
         self._session_start = time.time()
         self._last_check_at = None
         self._outage_start = None
         self._set_state(STATE_PENDING)
-        self._log("开始守护：将持续探测网络，一旦断网立刻自动重连。", "ok")
+        self._log("正在启动守护…", "dim")
         self._monitor = threading.Thread(
             target=self._monitor_loop,
             args=(dict(self._config), self._monitor_stop), daemon=True)
@@ -2719,13 +2729,17 @@ class GuiApp:
     def _monitor_loop(self, config, stop_event):
         """后台线程：只入队，不碰界面。"""
         try:
-            core.run_detection_loop(
+            result = core.run_detection_loop(
                 config,
                 stop_event=stop_event,
                 status_callback=lambda status: self._q.put(
                     ("monitor_status", (stop_event, status))),
                 duration_override=0,
             )
+            if result is False:
+                self._q.put(("monitor_blocked", stop_event))
+        except OSError as e:
+            core.log(f"无法启动守护：{e}", "ERROR")
         except Exception as e:
             core.log(f"Monitor loop crashed: {e}", "ERROR")
         finally:
@@ -2806,6 +2820,9 @@ class GuiApp:
             event, status = payload
             if event is self._monitor_stop and not event.is_set():
                 self._on_status_line(status)
+        elif kind == "monitor_blocked":
+            if payload is self._monitor_stop:
+                self._monitor_blocked = payload
         elif kind == "auth_done":
             ok, cost, detail, was_ok_already = payload
             if ok:
@@ -2820,11 +2837,17 @@ class GuiApp:
         elif kind == "monitor_done":
             if payload is not self._monitor_stop:
                 return
+            blocked = getattr(self, "_monitor_blocked", None) is payload
             self._monitor = None
             self._monitor_stop = None
+            if blocked:
+                self._session_start = None
             if self._state != STATE_EXITING:
                 self._set_state(STATE_IDLE)
-                self._log("守护已停止。", "dim")
+                if blocked:
+                    self._log("已有校园网守护正在运行，本次未启动；原守护继续运行。", "warn")
+                else:
+                    self._log("守护已停止。", "dim")
         elif kind == "show":
             self._show_window()
         elif kind == "exit":
@@ -2885,7 +2908,7 @@ class GuiApp:
     def _tag_for(level):
         if level == "ERROR":
             return "error"
-        if level in ("WARN", "DOWN"):
+        if level in ("WARN", "DOWN", "GUARD"):
             return "warn"
         if level in ("RECOVER", "AUTH"):
             return "ok"
@@ -3699,7 +3722,10 @@ class GuiApp:
         elif self._state == STATE_FAILED:
             self.hint_label.configure(text="重连没成功，后台仍在自动重试")
         elif self._state == STATE_IDLE:
-            self.hint_label.configure(text="尚未开始守护" if not running else "")
+            if getattr(self, "_monitor_blocked", None) is not None:
+                self.hint_label.configure(text="本次未启动：检测到其他守护已在运行")
+            else:
+                self.hint_label.configure(text="尚未开始守护" if not running else "")
 
         # 元信息
         parts = []

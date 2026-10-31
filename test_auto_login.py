@@ -34,6 +34,11 @@ class AutoLoginTests(unittest.TestCase):
         self.network_patch = patch.object(app.urllib.request, "urlopen", side_effect=AssertionError("Unexpected network request"))
         self.network_patch.start()
         self.addCleanup(self.network_patch.stop)
+        # check_network talks through open_direct (no system proxy); guard it too.
+        self.real_open_direct = app.open_direct
+        self.direct_patch = patch.object(app, "open_direct", side_effect=AssertionError("Unexpected direct network request"))
+        self.direct_patch.start()
+        self.addCleanup(self.direct_patch.stop)
 
     def portal_response(self, body, redirect=True):
         probe = Mock()
@@ -140,7 +145,7 @@ class AutoLoginTests(unittest.TestCase):
         resp = Mock()
         resp.geturl.return_value = final_url
         resp.read.return_value = body
-        return patch.object(app.urllib.request, "urlopen", return_value=resp)
+        return patch.object(app, "open_direct", return_value=resp)
 
     def test_same_site_https_upgrade_is_not_portal(self):
         # baidu.com 301s http -> https on a healthy network; must not read as down.
@@ -167,6 +172,82 @@ class AutoLoginTests(unittest.TestCase):
             ok, detail = app.check_network("http://www.baidu.com", 5, "baidu")
         self.assertFalse(ok)
         self.assertIn("missing", detail)
+
+    def test_check_sends_browser_headers(self):
+        # The check must look like the user's browser: on 2026-10-28 the portal
+        # path answered the browser but timed out the bare Python-urllib check.
+        seen = {}
+        resp = Mock()
+        resp.geturl.return_value = "https://www.baidu.com/"
+        resp.read.return_value = b"baidu"
+
+        def fake_open(request, timeout):
+            seen["headers"] = {k.lower(): v for k, v in request.header_items()}
+            seen["timeout"] = timeout
+            return resp
+
+        with patch.object(app, "open_direct", side_effect=fake_open):
+            self.assertEqual(
+                app.check_network("http://www.baidu.com", 5, "baidu"), (True, "OK"))
+        self.assertIn("mozilla", seen["headers"]["user-agent"].lower())
+        self.assertNotIn("python", seen["headers"]["user-agent"].lower())
+        self.assertEqual(seen["headers"]["accept-encoding"], "identity")
+        self.assertEqual(seen["timeout"], 5)
+
+    def test_open_direct_installs_an_empty_proxy_handler(self):
+        opener = Mock()
+        opener.open.return_value = "response"
+        request = app.urllib.request.Request("http://example.invalid/")
+        with patch.object(app.urllib.request, "build_opener", return_value=opener) as build:
+            self.assertEqual(self.real_open_direct(request, 3), "response")
+        handlers = build.call_args.args
+        proxy = [h for h in handlers if isinstance(h, app.urllib.request.ProxyHandler)]
+        self.assertEqual(len(proxy), 1, "open_direct must not inherit the system proxy")
+        self.assertEqual(proxy[0].proxies, {})
+
+    def test_usable_portal_client_ip_rejects_tunnel_and_special_ranges(self):
+        for value in ("198.18.0.1", "198.19.255.254", "169.254.1.1",
+                      "127.0.0.1", "0.0.0.0", "224.0.0.1", "not-an-ip", ""):
+            with self.subTest(value=value):
+                self.assertFalse(app.usable_portal_client_ip(value))
+        for value in ("10.150.74.11", "10.150.160.81", "192.168.1.5"):
+            with self.subTest(value=value):
+                self.assertTrue(app.usable_portal_client_ip(value))
+
+    def test_network_path_logs_proxy_and_route_source(self):
+        logged = []
+        with patch.object(app, "log", side_effect=lambda msg, level="INFO":
+                          logged.append(msg)):
+            with patch.object(app.urllib.request, "getproxies",
+                              return_value={"http": "http://127.0.0.1:7900"}), \
+                 patch.object(app, "local_route_address",
+                              return_value="10.150.74.11"):
+                app._log_network_path(self.config)
+            self.assertEqual(len(logged), 2)
+            self.assertIn("127.0.0.1:7900", logged[0])
+            self.assertIn("bypass", logged[0])
+            self.assertIn("route", logged[1].lower())
+            self.assertIn("10.150.74.11", logged[1])
+            self.assertNotIn("tunnel", logged[1])
+
+            logged.clear()
+            with patch.object(app.urllib.request, "getproxies", return_value={}), \
+                 patch.object(app, "local_route_address",
+                              return_value="198.18.0.1"):
+                app._log_network_path(self.config)
+        self.assertEqual(len(logged), 1, "no proxy configured -> only the route line")
+        self.assertIn("tunnel/reserved", logged[0])
+
+    def test_local_route_address_reports_the_source_address(self):
+        sock = Mock()
+        sock.getsockname.return_value = ("10.150.74.11", 51234)
+        with patch.object(app.socket, "socket", return_value=sock):
+            self.assertEqual(app.local_route_address("10.10.200.102"), "10.150.74.11")
+        self.assertTrue(sock.close.called)
+
+    def test_local_route_address_is_empty_when_the_probe_fails(self):
+        with patch.object(app.socket, "socket", side_effect=OSError("no socket")):
+            self.assertEqual(app.local_route_address("10.10.200.102"), "")
 
     def test_resident_tray_does_not_mutate_config(self):
         tray = app.TrayApp(self.config, start_hidden=True)
@@ -826,7 +907,7 @@ class AttemptTimingTests(unittest.TestCase):
         token = "Ab3xK9mQ2pL7v"
         error = app.urllib.error.URLError(
             f"failed at https://portal.example/index.jsp?session={token}")
-        with patch.object(app.urllib.request, "urlopen", side_effect=error):
+        with patch.object(app, "open_direct", side_effect=error):
             ok, detail = app.check_network(self.config["check_url"], 1)
         self.assertFalse(ok)
         self.assertNotIn(token, detail)
@@ -920,6 +1001,86 @@ class AttemptTimingTests(unittest.TestCase):
         joined = "\n".join(logged)
         self.assertNotIn("FAKE_TOKEN", joined)
         self.assertNotIn("66323863616466663861643538326666", joined)
+
+    def test_portal_login_bypasses_the_system_proxy(self):
+        # Like the connectivity check: the BRAS redirect only reaches us when
+        # the request is not answered by a local proxy.
+        probe = Mock()
+        probe.geturl.return_value = self.config["check_url"]
+        probe.read.return_value = b"location.href='/eportal/index.jsp?wlanuserip=10.0.0.1'"
+        page = Mock()
+        page.geturl.return_value = self.config["portal_url"] + "/eportal/index.jsp?wlanuserip=10.0.0.1"
+        page.read.return_value = b""
+        login = Mock(status=200)
+        login.read.return_value = b'{"result":"success"}'
+        opener = Mock()
+        opener.open.side_effect = [probe, page, login]
+        with patch.object(app.urllib.request, "build_opener", return_value=opener) as build:
+            ok, _ = app.do_auth_portal_post(self.config)
+        self.assertTrue(ok)
+        handlers = build.call_args.args
+        proxy = [h for h in handlers if isinstance(h, app.urllib.request.ProxyHandler)]
+        self.assertEqual(len(proxy), 1, "portal login must not inherit the system proxy")
+        self.assertEqual(proxy[0].proxies, {})
+
+    def _no_params_flow_opener(self, local_ip):
+        probe = Mock()
+        probe.geturl.return_value = self.config["check_url"]
+        probe.read.return_value = b"<html><title>portal</title></html>"
+        page = Mock()
+        page.geturl.return_value = self.config["portal_url"] + "/eportal/index.jsp"
+        page.read.return_value = (b"<script>alert('\xce\xc4\xbc\xfe\xce\xb4\xd7\xa2\xb2\xe1');"
+                                  b"</script>")
+        api = Mock()
+        api.geturl.return_value = (self.config["portal_url"]
+                                   + "/eportal/InterFace.do?method=pageInfo")
+        api.read.return_value = b""
+        opener = Mock()
+        opener.open.side_effect = [probe, page, api, api]
+        sock = Mock()
+        sock.getsockname.return_value = (local_ip, 51234)
+        return opener, sock
+
+    def test_no_login_is_posted_without_portal_parameters(self):
+        # 2026-10-28: with no BRAS redirect the old code sent only wlanuserip
+        # (a TUN address) and the portal rejected every attempt. Submitting is
+        # pointless; the attempt must report the real reason instead.
+        opener, sock = self._no_params_flow_opener("198.18.0.1")
+        logged = []
+        with patch.object(app, "log", side_effect=lambda msg, level="INFO":
+                          logged.append(msg)), \
+             patch.object(app.urllib.request, "build_opener", return_value=opener), \
+             patch.object(app.socket, "socket", return_value=sock):
+            ok, result = app.do_auth_portal_post(self.config, app.TimingRecord())
+        self.assertFalse(ok)
+        self.assertEqual(result.kind, app.RESULT_PORTAL_CONFIG_ERROR)
+        urls = [call.args[0].full_url for call in opener.open.call_args_list]
+        self.assertEqual(len(urls), 4, "discovery only: no login POST")
+        self.assertFalse(any("method=login" in url for url in urls))
+        joined = "\n".join(logged)
+        self.assertIn("Portal did not provide login parameters", joined)
+        self.assertIn("tunnel/reserved", joined)
+
+    def test_no_login_is_posted_even_with_a_plausible_local_address(self):
+        # A normal private IPv4 is still not a substitute for the portal's BRAS
+        # parameters: every measured attempt of that shape was rejected with
+        # "WEB认证设备未注册", so it must not be submitted either.
+        opener, sock = self._no_params_flow_opener("10.150.74.11")
+        logged = []
+        with patch.object(app, "log", side_effect=lambda msg, level="INFO":
+                          logged.append(msg)), \
+             patch.object(app.urllib.request, "build_opener", return_value=opener), \
+             patch.object(app.socket, "socket", return_value=sock):
+            ok, result = app.do_auth_portal_post(self.config, app.TimingRecord())
+        self.assertFalse(ok)
+        self.assertEqual(result.kind, app.RESULT_PORTAL_CONFIG_ERROR)
+        urls = [call.args[0].full_url for call in opener.open.call_args_list]
+        self.assertEqual(len(urls), 4, "discovery only: no login POST")
+        self.assertFalse(any("method=login" in url for url in urls))
+        joined = "\n".join(logged)
+        self.assertIn("Portal did not provide login parameters", joined)
+        self.assertIn("local route address 10.150.74.11", joined)
+        self.assertNotIn("tunnel/reserved", joined)
 
     def test_overlapping_auth_is_measured_not_assumed(self):
         # A single attempt must not report an actual overlapping submission.
